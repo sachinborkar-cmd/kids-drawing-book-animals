@@ -35,3 +35,4 @@ Thumbs.db
 # Private source materials & internal scripts
 *.pdf
 scripts/upload_to_s3.js
+
