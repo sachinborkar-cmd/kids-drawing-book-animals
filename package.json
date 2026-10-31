@@ -1,0 +1,21 @@
+{
+  "name": "kids-drawing-book-animals",
+  "version": "1.0.0",
+  "description": "Kids Drawing Book Animals - 3-Step E-Book Selling Website",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "node test/suite.js"
+  },
+  "keywords": [
+    "ebook",
+    "cloudflare-pages",
+    "cloudflare-workers",
+    "razorpay",
+    "aws-s3"
+  ],
+  "author": "Inkframe Press",
+  "license": "ISC"
+}

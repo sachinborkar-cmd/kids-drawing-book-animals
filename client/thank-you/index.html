@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Thank You for Your Order! | Kids Drawing Book – Animals</title>
+  <meta name="robots" content="noindex, nofollow">
+
+  <link rel="icon" type="image/png" href="/assets/images/book-cover.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@400;500;600;700&family=Quicksand:wght@500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/assets/css/style.css">
+</head>
+<body style="background-color: var(--c-cream);">
+
+  <!-- Header -->
+  <header class="site-header">
+    <div class="container header-inner">
+      <a href="/ebook/" class="brand-logo">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#FF914D" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+          <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+        </svg>
+        <span>Kids</span>Drawing Book
+      </a>
+      <span class="badge badge-green">✓ Payment Confirmed</span>
+    </div>
+  </header>
+
+  <main class="container">
+    <!-- Authorized Card (Shown when valid order_id + token are present) -->
+    <div id="authorized-card" class="thankyou-card">
+      <div style="width:68px; height:68px; background:var(--c-green-light); color:#2E8540; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:2.2rem; margin:0 auto 16px;">
+        ✓
+      </div>
+
+      <div class="badge badge-yellow" style="margin-bottom: 8px;">Order Confirmed • Lifetime Access</div>
+      <h1 style="font-size: 2.2rem; margin-bottom: 10px;">Your Little Artist's Adventure Starts Here!</h1>
+      <p style="color: var(--c-brown-muted); font-size: 1.05rem;">
+        Thank you for purchasing <strong>Kids Drawing Book – Animals</strong>. Your payment has been successfully verified!
+      </p>
+
+      <div style="background:var(--c-cream); padding:8px 16px; border-radius:var(--radius-sm); display:inline-block; margin:16px 0; font-size:0.85rem; font-weight:700;">
+        Order Reference: <span id="display-order-id" class="text-orange" style="font-family:monospace;">Loading...</span>
+      </div>
+
+      <!-- Book Visual & Download Action -->
+      <div class="download-box">
+        <img src="/assets/images/book-cover.png" alt="Kids Drawing Book Animals Cover" style="width:130px; height:auto; margin:0 auto 16px; border-radius:8px; box-shadow:0 8px 20px rgba(0,0,0,0.12);">
+
+        <h3 style="font-size:1.35rem; margin-bottom:4px;">Kids Drawing Book – Animals</h3>
+        <p style="font-size:0.9rem; color:var(--c-brown-muted); margin-bottom:16px;">
+          Full 22-Page Activity Book • High-Resolution Print Ready PDF
+        </p>
+
+        <div id="download-status" style="margin-bottom:14px; font-size:0.95rem;">
+          Preparing your secure download...
+        </div>
+
+        <a id="download-btn" href="#" class="btn btn-primary btn-lg btn-pulse" style="display:none; width:100%; max-width:420px; margin:0 auto;">
+          📥 Download Activity Book PDF
+        </a>
+      </div>
+
+      <!-- Instructions for Downloading and Printing -->
+      <div style="text-align:left; background:#fff; border:1.5px solid var(--c-peach); border-radius:var(--radius-md); padding:24px; margin-top:24px;">
+        <h4 style="font-size:1.15rem; margin-bottom:10px; color:var(--c-dark-brown);">
+          🎨 How to Get the Most Out of Your Book:
+        </h4>
+        <ol style="margin-left:20px; line-height:1.7; color:var(--c-brown-muted); font-size:0.95rem;">
+          <li><strong>Save your PDF:</strong> Click the button above and save the file to your computer, tablet, or phone.</li>
+          <li><strong>Print at your convenience:</strong> You can print all 22 pages together, or print single animal sheets whenever your child wants a quick colouring session.</li>
+          <li><strong>Laminate for reuse:</strong> Laminate the pages to let kids use dry-erase wipe-clean markers over and over!</li>
+          <li><strong>Award the certificate:</strong> Don't forget to fill in the Certificate of Completion on Page 22 to celebrate their wonderful effort!</li>
+        </ol>
+      </div>
+
+      <!-- Support Notice -->
+      <p style="font-size: 0.85rem; color: #888; margin-top: 24px;">
+        Need help or have questions? Email us at <a href="mailto:trenzy.helpme@gmail.com" class="text-orange" style="font-weight:700;">trenzy.helpme@gmail.com</a>.
+      </p>
+    </div>
+
+    <!-- Unauthorized Notice (Shown when someone directly visits /thank-you/ without purchase) -->
+    <div id="unauthorized-notice" class="thankyou-card" style="display:none; border-color:#e74c3c;">
+      <div style="width:68px; height:68px; background:#fde8e8; color:#c0392b; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:2rem; margin:0 auto 16px;">
+        🔒
+      </div>
+      <h2 style="font-size:1.8rem; margin-bottom:12px;">Access Restricted</h2>
+      <p style="color:var(--c-brown-muted); margin-bottom:20px;">
+        A verified purchase is required to access the Kids Drawing Book download page. If you have already completed payment, please check your confirmation email or contact our support team.
+      </p>
+      <div style="display:flex; justify-content:center; gap:12px;">
+        <a href="/ebook/" class="btn btn-primary">Go to Book Store</a>
+        <a href="mailto:trenzy.helpme@gmail.com" class="btn btn-secondary">Contact Support</a>
+      </div>
+    </div>
+  </main>
+
+  <footer class="site-footer" style="margin-top:60px;">
+    <div class="container text-center">
+      <p>&copy; 2026 Kids Drawing Book – Animals. All rights reserved.</p>
+    </div>
+  </footer>
+
+  <script src="/assets/js/config.js"></script>
+  <script src="/assets/js/analytics.js"></script>
+  <script src="/assets/js/thank-you.js"></script>
+</body>
+</html>

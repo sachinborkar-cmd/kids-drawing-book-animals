@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 595 842" width="600" height="848">
+  <rect width="100%" height="100%" fill="#ffffff"/>
+  <!-- Borders -->
+  <rect x="28" y="28" width="539" height="785" fill="none" stroke="#2e7d6e" stroke-width="3.5" rx="4"/>
+  <rect x="38" y="38" width="519" height="765" fill="none" stroke="#eeb33b" stroke-width="1.5" rx="3"/>
+
+  <!-- Title -->
+  <text x="297" y="145" font-family="'Nunito', 'Segoe UI', Arial, sans-serif" font-size="28" font-weight="800" fill="#2e7d6e" text-anchor="middle">Certificate of Completion</text>
+  <text x="297" y="220" font-family="'Segoe UI', Arial, sans-serif" font-size="16" fill="#333333" text-anchor="middle">This certificate is proudly awarded to</text>
+
+  <!-- Name underline -->
+  <line x1="125" y1="300" x2="470" y2="300" stroke="#888888" stroke-width="1.5"/>
+
+  <text x="297" y="350" font-family="'Segoe UI', Arial, sans-serif" font-size="15" fill="#333333" text-anchor="middle">for completing the Kids Drawing Book — Animals</text>
+
+  <!-- Three decorative award stars -->
+  <g transform="translate(165, 410) scale(1.3)" fill="#eeb33b">
+    <path d="M12 0l3.7 7.5L24 8.6l-6 5.8 1.4 8.3L12 18.8 4.6 22.7 6 14.4 0 8.6l8.3-1.1z"/>
+  </g>
+  <g transform="translate(282, 410) scale(1.3)" fill="#e05952">
+    <path d="M12 0l3.7 7.5L24 8.6l-6 5.8 1.4 8.3L12 18.8 4.6 22.7 6 14.4 0 8.6l8.3-1.1z"/>
+  </g>
+  <g transform="translate(398, 410) scale(1.3)" fill="#4488db">
+    <path d="M12 0l3.7 7.5L24 8.6l-6 5.8 1.4 8.3L12 18.8 4.6 22.7 6 14.4 0 8.6l8.3-1.1z"/>
+  </g>
+
+  <!-- Signatures -->
+  <text x="95" y="705" font-family="'Segoe UI', Arial, sans-serif" font-size="13" fill="#555555">Date:</text>
+  <line x1="135" y1="705" x2="265" y2="705" stroke="#888888" stroke-width="1.2"/>
+
+  <text x="95" y="750" font-family="'Segoe UI', Arial, sans-serif" font-size="13" fill="#555555">Teacher / Parent signature:</text>
+  <line x1="260" y1="750" x2="495" y2="750" stroke="#888888" stroke-width="1.2"/>
+
+  <!-- Footer -->
+  <text x="34" y="818" font-family="'Segoe UI', Arial, sans-serif" font-size="10" fill="#aaaaaa">Kids Drawing Book — Animals</text>
+  <text x="530" y="818" font-family="'Segoe UI', Arial, sans-serif" font-size="10" fill="#aaaaaa">Page 22</text>
+</svg>

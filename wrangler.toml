@@ -1,0 +1,20 @@
+name = "kids-drawing-book-animals"
+compatibility_date = "2024-09-01"
+pages_build_output_dir = "./client"
+
+# Cloudflare D1 Database binding
+[[d1_databases]]
+binding = "DB"
+database_name = "kids-drawing-book-db"
+database_id = "7cba95dc-6955-4e16-9973-5d912c1c1a16"
+
+# Public / default variables (Secrets like RAZORPAY_KEY_SECRET, AWS_SECRET_ACCESS_KEY are added via 'wrangler secret put' in production)
+[vars]
+PRODUCT_PRICE = "149"
+PRODUCT_CURRENCY = "INR"
+RAZORPAY_KEY_ID = "rzp_test_placeholder"
+AWS_REGION = "ap-south-1"
+AWS_S3_BUCKET = "inkframepress-private-ebooks-442189079113-ap-south-1-an"
+S3_PDF_KEY = "Kids_Drawing_Book_Animals_School_Edition.pdf"
+DOWNLOAD_EXPIRY_SECONDS = "600"
+SUPPORT_EMAIL = "trenzy.helpme@gmail.com"

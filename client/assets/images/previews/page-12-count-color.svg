@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 595 842" width="600" height="848">
+  <rect width="100%" height="100%" fill="#ffffff"/>
+  <!-- Title & Subtitle -->
+  <text x="297" y="85" font-family="'Nunito', 'Segoe UI', Arial, sans-serif" font-size="28" font-weight="800" fill="#1f4e5f" text-anchor="middle">Count &amp; Color</text>
+  <text x="297" y="112" font-family="'Segoe UI', Arial, sans-serif" font-size="14" fill="#4a7c8c" text-anchor="middle">Count each row, write the number in the box, then color them in!</text>
+
+  <!-- Row 1: Stars -->
+  <text x="62" y="175" font-family="'Segoe UI', Arial, sans-serif" font-size="16" font-weight="700" fill="#2a2a2a">How many stars?</text>
+  <g fill="#f2b035" stroke="#f2b035">
+    <!-- 4 Stars -->
+    <path transform="translate(68, 205) scale(0.9)" d="M12 0l3.7 7.5L24 8.6l-6 5.8 1.4 8.3L12 18.8 4.6 22.7 6 14.4 0 8.6l8.3-1.1z"/>
+    <path transform="translate(118, 205) scale(0.9)" d="M12 0l3.7 7.5L24 8.6l-6 5.8 1.4 8.3L12 18.8 4.6 22.7 6 14.4 0 8.6l8.3-1.1z"/>
+    <path transform="translate(168, 205) scale(0.9)" d="M12 0l3.7 7.5L24 8.6l-6 5.8 1.4 8.3L12 18.8 4.6 22.7 6 14.4 0 8.6l8.3-1.1z"/>
+    <path transform="translate(218, 205) scale(0.9)" d="M12 0l3.7 7.5L24 8.6l-6 5.8 1.4 8.3L12 18.8 4.6 22.7 6 14.4 0 8.6l8.3-1.1z"/>
+  </g>
+  <rect x="480" y="200" width="34" height="34" fill="none" stroke="#888888" stroke-width="1.5" rx="3"/>
+
+  <!-- Row 2: Balloons -->
+  <text x="62" y="305" font-family="'Segoe UI', Arial, sans-serif" font-size="16" font-weight="700" fill="#2a2a2a">How many balloons?</text>
+  <g fill="#ffffff" stroke="#3e7fb3" stroke-width="2.5">
+    <circle cx="80" cy="350" r="13"/>
+    <circle cx="128" cy="350" r="13"/>
+    <circle cx="176" cy="350" r="13"/>
+    <circle cx="224" cy="350" r="13"/>
+    <circle cx="272" cy="350" r="13"/>
+    <circle cx="320" cy="350" r="13"/>
+  </g>
+  <rect x="480" y="333" width="34" height="34" fill="none" stroke="#888888" stroke-width="1.5" rx="3"/>
+
+  <!-- Row 3: Trees -->
+  <text x="62" y="435" font-family="'Segoe UI', Arial, sans-serif" font-size="16" font-weight="700" fill="#2a2a2a">How many trees?</text>
+  <g fill="#ffffff" stroke="#3e9b6b" stroke-width="2.5">
+    <polygon points="80,470 65,498 95,498"/>
+    <polygon points="128,470 113,498 143,498"/>
+    <polygon points="176,470 161,498 191,498"/>
+  </g>
+  <rect x="480" y="467" width="34" height="34" fill="none" stroke="#888888" stroke-width="1.5" rx="3"/>
+
+  <!-- Footer -->
+  <text x="34" y="818" font-family="'Segoe UI', Arial, sans-serif" font-size="10" fill="#aaaaaa">Kids Drawing Book — Animals</text>
+  <text x="530" y="818" font-family="'Segoe UI', Arial, sans-serif" font-size="10" fill="#aaaaaa">Page 12</text>
+</svg>

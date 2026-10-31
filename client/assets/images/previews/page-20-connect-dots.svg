@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 595 842" width="600" height="848">
+  <rect width="100%" height="100%" fill="#ffffff"/>
+  <!-- Title & Subtitle -->
+  <text x="297" y="85" font-family="'Nunito', 'Segoe UI', Arial, sans-serif" font-size="28" font-weight="800" fill="#1f4e5f" text-anchor="middle">Connect the Dots</text>
+  <text x="297" y="112" font-family="'Segoe UI', Arial, sans-serif" font-size="14" fill="#4a7c8c" text-anchor="middle">Join the dots in order from 1 to 10, then color your shape!</text>
+
+  <!-- Numbered Dots for Star Shape -->
+  <!-- 1: bottom center -->
+  <circle cx="297" cy="735" r="5" fill="#000000"/>
+  <text x="297" y="722" font-family="'Segoe UI', Arial, sans-serif" font-size="15" font-weight="800" fill="#000000" text-anchor="middle">1</text>
+
+  <!-- 2: lower right-middle -->
+  <circle cx="344" cy="593" r="5" fill="#000000"/>
+  <text x="344" y="580" font-family="'Segoe UI', Arial, sans-serif" font-size="15" font-weight="800" fill="#000000" text-anchor="middle">2</text>
+
+  <!-- 3: bottom-right tip -->
+  <circle cx="470" cy="585" r="5" fill="#000000"/>
+  <text x="470" y="572" font-family="'Segoe UI', Arial, sans-serif" font-size="15" font-weight="800" fill="#000000" text-anchor="middle">3</text>
+
+  <!-- 4: right inner crook -->
+  <circle cx="372" cy="485" r="5" fill="#000000"/>
+  <text x="372" y="472" font-family="'Segoe UI', Arial, sans-serif" font-size="15" font-weight="800" fill="#000000" text-anchor="middle">4</text>
+
+  <!-- 5: top-right tip -->
+  <circle cx="406" cy="356" r="5" fill="#000000"/>
+  <text x="406" y="343" font-family="'Segoe UI', Arial, sans-serif" font-size="15" font-weight="800" fill="#000000" text-anchor="middle">5</text>
+
+  <!-- 6: top center crook -->
+  <circle cx="297" cy="426" r="5" fill="#000000"/>
+  <text x="297" y="413" font-family="'Segoe UI', Arial, sans-serif" font-size="15" font-weight="800" fill="#000000" text-anchor="middle">6</text>
+
+  <!-- 7: top-left tip -->
+  <circle cx="188" cy="356" r="5" fill="#000000"/>
+  <text x="188" y="343" font-family="'Segoe UI', Arial, sans-serif" font-size="15" font-weight="800" fill="#000000" text-anchor="middle">7</text>
+
+  <!-- 8: left inner crook -->
+  <circle cx="222" cy="485" r="5" fill="#000000"/>
+  <text x="222" y="472" font-family="'Segoe UI', Arial, sans-serif" font-size="15" font-weight="800" fill="#000000" text-anchor="middle">8</text>
+
+  <!-- 9: bottom-left tip -->
+  <circle cx="122" cy="585" r="5" fill="#000000"/>
+  <text x="122" y="572" font-family="'Segoe UI', Arial, sans-serif" font-size="15" font-weight="800" fill="#000000" text-anchor="middle">9</text>
+
+  <!-- 10: lower left-middle -->
+  <circle cx="250" cy="593" r="5" fill="#000000"/>
+  <text x="250" y="580" font-family="'Segoe UI', Arial, sans-serif" font-size="15" font-weight="800" fill="#000000" text-anchor="middle">10</text>
+
+  <!-- Footer -->
+  <text x="34" y="818" font-family="'Segoe UI', Arial, sans-serif" font-size="10" fill="#aaaaaa">Kids Drawing Book — Animals</text>
+  <text x="530" y="818" font-family="'Segoe UI', Arial, sans-serif" font-size="10" fill="#aaaaaa">Page 20</text>
+</svg>
