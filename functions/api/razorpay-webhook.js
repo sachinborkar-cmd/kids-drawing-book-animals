@@ -5,29 +5,70 @@
  */
 export async function onRequestPost({ request, env }) {
   try {
-    const rawBody = await request.text();
-    const signature = request.headers.get('x-razorpay-signature');
+    // 1. Fail closed if webhook secret is not configured
     const webhookSecret = env.RAZORPAY_WEBHOOK_SECRET;
+    if (!webhookSecret) {
+      console.error('[Razorpay Webhook]: RAZORPAY_WEBHOOK_SECRET is not configured.');
+      return new Response(JSON.stringify({ error: 'Webhook secret not configured' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
 
-    // Verify webhook signature if configured
-    if (webhookSecret && signature) {
-      const keyObj = await crypto.subtle.importKey(
-        'raw',
-        new TextEncoder().encode(webhookSecret),
-        { name: 'HMAC', hash: 'SHA-256' },
-        false,
-        ['sign']
-      );
-      const computed = await crypto.subtle.sign('HMAC', keyObj, new TextEncoder().encode(rawBody));
-      const expected = Array.from(new Uint8Array(computed)).map(b => b.toString(16).padStart(2, '0')).join('');
+    // 2. Fail closed if signature header is missing
+    const signature = request.headers?.get ? request.headers.get('x-razorpay-signature') : null;
+    if (!signature) {
+      console.error('[Razorpay Webhook]: Missing x-razorpay-signature header.');
+      return new Response(JSON.stringify({ error: 'Missing webhook signature header' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
 
-      if (expected.toLowerCase() !== signature.toLowerCase()) {
-        console.error('[Razorpay Webhook]: Signature mismatch.');
-        return new Response('Invalid webhook signature', { status: 400 });
+    // Read exact raw request body for HMAC verification
+    const rawBody = await request.text();
+
+    // 3. Cryptographically verify signature using HMAC-SHA256
+    const keyObj = await crypto.subtle.importKey(
+      'raw',
+      new TextEncoder().encode(webhookSecret),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign']
+    );
+    const computed = await crypto.subtle.sign('HMAC', keyObj, new TextEncoder().encode(rawBody));
+    const expected = Array.from(new Uint8Array(computed)).map(b => b.toString(16).padStart(2, '0')).join('');
+
+    // Constant-time comparison to prevent timing attacks
+    const sigLower = signature.toLowerCase().trim();
+    const expLower = expected.toLowerCase().trim();
+    let diff = 0;
+    if (sigLower.length !== expLower.length) {
+      diff = 1;
+    } else {
+      for (let i = 0; i < expLower.length; i++) {
+        diff |= sigLower.charCodeAt(i) ^ expLower.charCodeAt(i);
       }
     }
 
-    const event = JSON.parse(rawBody);
+    if (diff !== 0) {
+      console.error('[Razorpay Webhook]: Signature mismatch.');
+      return new Response(JSON.stringify({ error: 'Invalid webhook signature' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    let event;
+    try {
+      event = JSON.parse(rawBody);
+    } catch (parseErr) {
+      console.error('[Razorpay Webhook]: Malformed JSON payload:', parseErr.message);
+      return new Response(JSON.stringify({ error: 'Invalid JSON payload' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
     const eventId = event.event_id || event.id || `evt_${Date.now()}`;
     const eventType = event.event;
 
