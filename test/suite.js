@@ -56,6 +56,16 @@ class MockD1 {
             return { success: true };
           }
           if (q.startsWith('UPDATE orders') && q.includes("status = 'paid'")) {
+            if (args.length === 3) {
+              const [payment_id, token, rzp_order_id] = args;
+              const rec = this.orders.get(rzp_order_id) || Array.from(this.orders.values()).find(o => o.id === rzp_order_id);
+              if (rec) {
+                rec.status = 'paid';
+                rec.razorpay_payment_id = rec.razorpay_payment_id || payment_id;
+                rec.download_token = rec.download_token || token;
+              }
+              return { success: true };
+            }
             const [payment_id, signature, token, rzp_order_id] = args;
             const rec = this.orders.get(rzp_order_id) || Array.from(this.orders.values()).find(o => o.id === rzp_order_id);
             if (rec) {
@@ -243,10 +253,142 @@ await test('POST /api/verify-payment strictly rejects invalid / tampered signatu
 });
 
 // 4. WEBHOOK IDEMPOTENCY & FAILED PAYMENTS AUDIT
-console.log('\n[Audit Test 4: Webhook Idempotency & Failure Handling]');
+console.log('\n[Audit Test 4: Webhook Security, Idempotency & Failure Handling]');
+
+// Helper to compute HMAC-SHA256 signature for test webhooks
+async function computeWebhookSig(payload, secret) {
+  const enc = new TextEncoder().encode(secret);
+  const keyObj = await crypto.subtle.importKey('raw', enc, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sigBytes = await crypto.subtle.sign('HMAC', keyObj, new TextEncoder().encode(payload));
+  return Array.from(new Uint8Array(sigBytes)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+await test('POST /api/razorpay-webhook fails closed (HTTP 500) if RAZORPAY_WEBHOOK_SECRET is missing', async () => {
+  const rawPayload = JSON.stringify({ event_id: 'evt_no_secret', event: 'payment.captured' });
+  const req = {
+    text: async () => rawPayload,
+    headers: { get: (h) => h === 'x-razorpay-signature' ? 'some_sig' : null }
+  };
+  const envNoSecret = { ...mockEnv, RAZORPAY_WEBHOOK_SECRET: '' };
+  const res = await handleWebhook({ request: req, env: envNoSecret });
+  assert.equal(res.status, 500);
+  const body = JSON.parse(await res.text());
+  assert.equal(body.error, 'Webhook secret not configured');
+});
+
+await test('POST /api/razorpay-webhook rejects request (HTTP 400) if x-razorpay-signature is missing', async () => {
+  const rawPayload = JSON.stringify({ event_id: 'evt_no_sig', event: 'payment.captured' });
+  const req = {
+    text: async () => rawPayload,
+    headers: { get: () => null }
+  };
+  const res = await handleWebhook({ request: req, env: mockEnv });
+  assert.equal(res.status, 400);
+  const body = JSON.parse(await res.text());
+  assert.equal(body.error, 'Missing webhook signature header');
+});
+
+await test('POST /api/razorpay-webhook rejects request (HTTP 400) if signature is invalid / tampered', async () => {
+  const rawPayload = JSON.stringify({ event_id: 'evt_bad_sig', event: 'payment.captured' });
+  const req = {
+    text: async () => rawPayload,
+    headers: { get: (h) => h === 'x-razorpay-signature' ? 'deadbeef_invalid_signature_hex' : null }
+  };
+  const res = await handleWebhook({ request: req, env: mockEnv });
+  assert.equal(res.status, 400);
+  const body = JSON.parse(await res.text());
+  assert.equal(body.error, 'Invalid webhook signature');
+});
+
+await test('POST /api/razorpay-webhook accepts request with valid HMAC-SHA256 signature', async () => {
+  const orderId = 'order_valid_sig_test';
+  mockDb.orders.set(orderId, {
+    id: 'ord_valid_sig',
+    razorpay_order_id: orderId,
+    status: 'created',
+    download_token: null
+  });
+
+  const rawPayload = JSON.stringify({
+    event_id: 'evt_valid_sig_test',
+    event: 'payment.captured',
+    payload: { payment: { entity: { order_id: orderId, id: 'pay_valid_sig_1' } } }
+  });
+  const validSig = await computeWebhookSig(rawPayload, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+
+  const req = {
+    text: async () => rawPayload,
+    headers: { get: (h) => h === 'x-razorpay-signature' ? validSig : null }
+  };
+  const res = await handleWebhook({ request: req, env: mockEnv });
+  assert.equal(res.status, 200);
+  const body = JSON.parse(await res.text());
+  assert.equal(body.status, 'success');
+});
+
+await test('POST /api/razorpay-webhook idempotently skips duplicate events (already processed)', async () => {
+  const dupOrderId = 'order_dup_webhook_test';
+  mockDb.orders.set(dupOrderId, {
+    id: 'ord_dup_webhook',
+    razorpay_order_id: dupOrderId,
+    status: 'created',
+    download_token: null
+  });
+
+  const rawPayload = JSON.stringify({
+    event_id: 'evt_dup_test_456',
+    event: 'payment.captured',
+    payload: { payment: { entity: { order_id: dupOrderId, id: 'pay_captured_dup' } } }
+  });
+  const validSig = await computeWebhookSig(rawPayload, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+
+  const req = {
+    text: async () => rawPayload,
+    headers: { get: (h) => h === 'x-razorpay-signature' ? validSig : null }
+  };
+
+  // First delivery
+  const res1 = await handleWebhook({ request: req, env: mockEnv });
+  assert.equal(res1.status, 200);
+
+  // Second delivery (duplicate event)
+  const res2 = await handleWebhook({ request: req, env: mockEnv });
+  assert.equal(res2.status, 200);
+  const data2 = JSON.parse(await res2.text());
+  assert.equal(data2.status, 'already_processed');
+});
+
+await test('POST /api/razorpay-webhook handles payment.captured, marks order paid, and issues download token', async () => {
+  const capturedOrderId = 'order_captured_webhook_test';
+  mockDb.orders.set(capturedOrderId, {
+    id: 'ord_captured',
+    razorpay_order_id: capturedOrderId,
+    status: 'created',
+    download_token: null
+  });
+
+  const rawPayload = JSON.stringify({
+    event_id: 'evt_captured_test_789',
+    event: 'payment.captured',
+    payload: { payment: { entity: { order_id: capturedOrderId, id: 'pay_cap_789' } } }
+  });
+  const validSig = await computeWebhookSig(rawPayload, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+
+  const req = {
+    text: async () => rawPayload,
+    headers: { get: (h) => h === 'x-razorpay-signature' ? validSig : null }
+  };
+  const res = await handleWebhook({ request: req, env: mockEnv });
+  assert.equal(res.status, 200);
+
+  const orderRec = mockDb.orders.get(capturedOrderId);
+  assert.equal(orderRec.status, 'paid');
+  assert.equal(orderRec.razorpay_payment_id, 'pay_cap_789');
+  assert(orderRec.download_token, 'download_token must be generated');
+});
+
 await test('POST /api/razorpay-webhook handles payment.failed and marks order failed', async () => {
   const failedOrderId = 'order_failed_test_99';
-  // Insert order into mock DB
   mockDb.orders.set(failedOrderId, {
     id: 'ord_failed',
     razorpay_order_id: failedOrderId,
@@ -259,39 +401,17 @@ await test('POST /api/razorpay-webhook handles payment.failed and marks order fa
     event: 'payment.failed',
     payload: { payment: { entity: { order_id: failedOrderId, id: 'pay_failed_1' } } }
   });
+  const validSig = await computeWebhookSig(rawPayload, mockEnv.RAZORPAY_WEBHOOK_SECRET);
 
   const req = {
     text: async () => rawPayload,
-    headers: { get: () => null } // No secret check in dev mock
+    headers: { get: (h) => h === 'x-razorpay-signature' ? validSig : null }
   };
   const res = await handleWebhook({ request: req, env: mockEnv });
   assert.equal(res.status, 200);
 
   // Verify order status is marked failed
   assert.equal(mockDb.orders.get(failedOrderId).status, 'failed');
-});
-
-await test('Duplicate webhook events are idempotently ignored', async () => {
-  const rawPayload = JSON.stringify({
-    event_id: 'evt_dup_123',
-    event: 'payment.captured',
-    payload: { payment: { entity: { order_id: createdOrder.razorpay_order_id, id: 'pay_captured_1' } } }
-  });
-
-  const req = {
-    text: async () => rawPayload,
-    headers: { get: () => null }
-  };
-
-  // First delivery
-  const res1 = await handleWebhook({ request: req, env: mockEnv });
-  assert.equal(res1.status, 200);
-
-  // Second delivery (duplicate event)
-  const res2 = await handleWebhook({ request: req, env: mockEnv });
-  assert.equal(res2.status, 200);
-  const data2 = JSON.parse(await res2.text());
-  assert.equal(data2.status, 'already_processed');
 });
 
 // 5. SECURE DOWNLOAD & 10-MINUTE EXPIRY AUDIT
