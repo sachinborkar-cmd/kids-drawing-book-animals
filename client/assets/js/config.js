@@ -5,8 +5,8 @@
 const PRODUCT_CONFIG = {
   id: 'kids-drawing-book-animals',
   title: 'Kids Drawing Book – Animals',
-  subtitle: 'A School-Ready Coloring & Activity Book for Ages 3–9',
-  ageGroup: 'Ages 3–9',
+  subtitle: 'A School-Ready Coloring & Activity Book for Ages 3–12 Years',
+  ageGroup: 'Ages 3–12 Years',
   pages: 22,
   animalsCount: 13,
   format: 'Printable Digital PDF',
