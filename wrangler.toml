@@ -14,6 +14,10 @@ binding = "DB"
 database_name = "kids-drawing-book-db-staging"
 database_id = "c05e1a35-8da2-463d-a6b3-627ac86749b3"
 
+# Preview / Staging Environment Variables Override
+[env.preview.vars]
+RAZORPAY_KEY_ID = "rzp_test_TuaqfpTw4hAqFw"
+
 # Public / default variables (Secrets like RAZORPAY_KEY_SECRET, AWS_SECRET_ACCESS_KEY are added via 'wrangler secret put' in production)
 [vars]
 PRODUCT_PRICE = "149"
