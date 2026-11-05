@@ -41,18 +41,39 @@ export async function getS3PresignedUrl({
   expiresInSeconds = 600,
   responseContentDisposition = 'attachment; filename="Kids_Drawing_Book_Animals_School_Edition.pdf"'
 }) {
+  const cleanAccessKeyId = typeof accessKeyId === 'string' ? accessKeyId.trim() : '';
+  const cleanSecretAccessKey = typeof secretAccessKey === 'string' ? secretAccessKey.trim() : '';
+
+  if (!cleanAccessKeyId || !cleanSecretAccessKey) {
+    throw new Error('Missing AWS credentials for presigned URL generation');
+  }
+
+  const isMockKey = cleanAccessKeyId.startsWith('MOCK_');
+  const validKeyPattern = isMockKey ? /^[A-Za-z0-9_]{16,40}$/ : /^(AKIA|ASIA)[A-Z0-9]{16}$/;
+  if (!validKeyPattern.test(cleanAccessKeyId)) {
+    throw new Error('Invalid AWS access key ID format');
+  }
+
+  if (cleanSecretAccessKey.length < 20) {
+    throw new Error('Invalid AWS secret access key format');
+  }
+
+  const cleanBucket = (bucket || '').trim();
+  const cleanRegion = (region || '').trim();
+  const cleanKey = (key || '').trim();
+
   const now = new Date();
   const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, ''); // YYYYMMDDTHHMMSSZ
   const dateStamp = amzDate.substring(0, 8); // YYYYMMDD
 
-  const host = `${bucket}.s3.${region}.amazonaws.com`;
-  const canonicalUri = `/${encodeURIComponent(key).replace(/%2F/g, '/')}`;
-  const credentialScope = `${dateStamp}/${region}/s3/aws4_request`;
+  const host = `${cleanBucket}.s3.${cleanRegion}.amazonaws.com`;
+  const canonicalUri = `/${encodeURIComponent(cleanKey).replace(/%2F/g, '/')}`;
+  const credentialScope = `${dateStamp}/${cleanRegion}/s3/aws4_request`;
 
   // Query parameters in canonical alphabetical order
   const queryParams = {
     'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
-    'X-Amz-Credential': `${accessKeyId}/${credentialScope}`,
+    'X-Amz-Credential': `${cleanAccessKeyId}/${credentialScope}`,
     'X-Amz-Date': amzDate,
     'X-Amz-Expires': expiresInSeconds.toString(),
     'X-Amz-SignedHeaders': 'host'
@@ -90,8 +111,8 @@ export async function getS3PresignedUrl({
   ].join('\n');
 
   // Derive signing key: HMAC(HMAC(HMAC(HMAC('AWS4' + Secret, Date), Region), Service), 'aws4_request')
-  const kDate = await hmacRaw(`AWS4${secretAccessKey}`, dateStamp);
-  const kRegion = await hmacRaw(kDate, region);
+  const kDate = await hmacRaw(`AWS4${cleanSecretAccessKey}`, dateStamp);
+  const kRegion = await hmacRaw(kDate, cleanRegion);
   const kService = await hmacRaw(kRegion, 's3');
   const kSigning = await hmacRaw(kService, 'aws4_request');
 

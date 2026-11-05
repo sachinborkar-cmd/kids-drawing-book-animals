@@ -17,6 +17,9 @@ database_id = "c05e1a35-8da2-463d-a6b3-627ac86749b3"
 # Preview / Staging Environment Variables Override
 [env.preview.vars]
 RAZORPAY_KEY_ID = "rzp_test_TuaqfpTw4hAqFw"
+AWS_REGION = "ap-southeast-2"
+AWS_S3_BUCKET = "kids-drawing-book-staging-441378339677"
+S3_PDF_KEY = "Kids_Drawing_Book_Animals_School_Edition.pdf"
 
 # Public / default variables (Secrets like RAZORPAY_KEY_SECRET, AWS_SECRET_ACCESS_KEY are added via 'wrangler secret put' in production)
 [vars]

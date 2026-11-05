@@ -65,11 +65,15 @@ export async function onRequestGet({ request, env }) {
       });
     }
 
-    // AWS S3 Configuration
-    const bucket = env.AWS_S3_BUCKET || 'inkframepress-private-ebooks-442189079113-ap-south-1-an';
-    const region = env.AWS_REGION || 'ap-south-1';
-    const accessKeyId = env.AWS_ACCESS_KEY_ID;
-    const secretAccessKey = env.AWS_SECRET_ACCESS_KEY;
+    // AWS S3 Configuration (supports canonical vars and Cloudflare dashboard aliases)
+    const bucket = (env.AWS_S3_BUCKET || env.Bucket || 'kids-drawing-book-staging-441378339677').trim();
+    const region = (env.AWS_REGION || env.Region || 'ap-southeast-2').trim();
+    const pdfKey = (env.S3_PDF_KEY || env.File || 'Kids_Drawing_Book_Animals_School_Edition.pdf').trim();
+    const rawAccessKeyId = env.AWS_ACCESS_KEY_ID;
+    const rawSecretAccessKey = env.AWS_SECRET_ACCESS_KEY;
+
+    const accessKeyId = typeof rawAccessKeyId === 'string' ? rawAccessKeyId.trim() : '';
+    const secretAccessKey = typeof rawSecretAccessKey === 'string' ? rawSecretAccessKey.trim() : '';
 
     if (!accessKeyId || !secretAccessKey) {
       console.error('[Download Error]: AWS credentials not configured in environment bindings');
@@ -78,7 +82,26 @@ export async function onRequestGet({ request, env }) {
         headers: { 'Content-Type': 'application/json' }
       });
     }
-    const pdfKey = env.S3_PDF_KEY || 'Kids_Drawing_Book_Animals_School_Edition.pdf';
+
+    // Validate access key ID format without logging key values (Standard 20-char AKIA/ASIA key or test mock)
+    const isMockKey = accessKeyId.startsWith('MOCK_');
+    const validKeyPattern = isMockKey ? /^[A-Za-z0-9_]{16,40}$/ : /^(AKIA|ASIA)[A-Z0-9]{16}$/;
+    if (!validKeyPattern.test(accessKeyId)) {
+      console.error('[Download Error]: AWS_ACCESS_KEY_ID format is invalid (length: ' + accessKeyId.length + ')');
+      return new Response(JSON.stringify({ error: 'Storage credentials format invalid' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    if (secretAccessKey.length < 20) {
+      console.error('[Download Error]: AWS_SECRET_ACCESS_KEY format is invalid or too short');
+      return new Response(JSON.stringify({ error: 'Storage credentials format invalid' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
     const expirySeconds = parseInt(env.DOWNLOAD_EXPIRY_SECONDS || '600', 10);
 
     // Generate secure temporary presigned download URL (Valid for 10 minutes)

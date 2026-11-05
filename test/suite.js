@@ -439,6 +439,67 @@ await test('GET /api/download issues 10-minute temporary AWS SigV4 URL for verif
   assert(data.download_url.includes('X-Amz-Signature='), 'SigV4 URL must be cryptographically signed');
 });
 
+await test('GET /api/download sanitizes credentials with trailing newlines and whitespace', async () => {
+  const envWithNewlines = {
+    ...mockEnv,
+    AWS_ACCESS_KEY_ID: '  MOCK_AWS_ACCESS_KEY_ID_123\n\r  ',
+    AWS_SECRET_ACCESS_KEY: '  mock_aws_secret_access_key_xyz_456\n  '
+  };
+  const req = { url: `http://localhost/api/download?order_id=${createdOrder.order_id}&token=${validToken}` };
+  const res = await handleDownload({ request: req, env: envWithNewlines });
+  assert.equal(res.status, 200);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.success, true);
+  assert(!data.download_url.includes('%0A'), 'Presigned URL must not contain encoded newline %0A');
+  assert(!data.download_url.includes('\n'), 'Presigned URL must not contain raw newline');
+  assert(data.download_url.includes('MOCK_AWS_ACCESS_KEY_ID_123%2F'), 'Credential scope must contain clean trimmed key');
+});
+
+await test('GET /api/download rejects malformed credentials safely', async () => {
+  const envMalformed = {
+    ...mockEnv,
+    AWS_ACCESS_KEY_ID: 'INVALID_SHORT_KEY',
+    NODE_ENV: 'production'
+  };
+  const req = { url: `http://localhost/api/download?order_id=${createdOrder.order_id}&token=${validToken}` };
+  const res = await handleDownload({ request: req, env: envMalformed });
+  assert.equal(res.status, 500);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.error, 'Storage credentials format invalid');
+});
+
+await test('GET /api/download fails closed if AWS credentials are unset', async () => {
+  const envMissing = {
+    ...mockEnv,
+    AWS_ACCESS_KEY_ID: '',
+    AWS_SECRET_ACCESS_KEY: ''
+  };
+  const req = { url: `http://localhost/api/download?order_id=${createdOrder.order_id}&token=${validToken}` };
+  const res = await handleDownload({ request: req, env: envMissing });
+  assert.equal(res.status, 500);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.error, 'Storage credentials not configured');
+});
+
+await test('GET /api/download correctly supports Sydney staging bucket and dashboard alias overrides', async () => {
+  const stagingEnv = {
+    ...mockEnv,
+    AWS_S3_BUCKET: undefined,
+    AWS_REGION: undefined,
+    S3_PDF_KEY: undefined,
+    Bucket: 'kids-drawing-book-staging-441378339677',
+    Region: 'ap-southeast-2',
+    File: 'Kids_Drawing_Book_Animals_School_Edition.pdf'
+  };
+  const req = { url: `http://localhost/api/download?order_id=${createdOrder.order_id}&token=${validToken}` };
+  const res = await handleDownload({ request: req, env: stagingEnv });
+  assert.equal(res.status, 200);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.success, true);
+  assert(data.download_url.includes('kids-drawing-book-staging-441378339677.s3.ap-southeast-2.amazonaws.com'), 'Host must match Sydney staging bucket');
+  assert(data.download_url.includes('ap-southeast-2%2Fs3%2Faws4_request'), 'Credential scope must reflect ap-southeast-2');
+});
+
 // 6. ANALYTICS DEDUPLICATION AUDIT
 console.log('\n[Audit Test 6: Analytics & Conversion Event Protection]');
 await test('analytics.js deduplicates Purchase event on repeat triggers', async () => {
