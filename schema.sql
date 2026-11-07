@@ -31,3 +31,22 @@ CREATE TABLE IF NOT EXISTS webhook_logs (
   payload TEXT,
   processed_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Table: email_outbox (For Asynchronous Post-Purchase Delivery & Idempotency)
+CREATE TABLE IF NOT EXISTS email_outbox (
+  id TEXT PRIMARY KEY,
+  order_id TEXT NOT NULL,
+  recipient_email TEXT NOT NULL,
+  email_type TEXT NOT NULL DEFAULT 'purchase_delivery',
+  status TEXT NOT NULL DEFAULT 'pending', -- 'pending', 'processing', 'sent', 'failed'
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at TEXT,
+  sent_at TEXT,
+  error_message TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (order_id, email_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_outbox_status ON email_outbox(status);
+CREATE INDEX IF NOT EXISTS idx_email_outbox_order ON email_outbox(order_id);

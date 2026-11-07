@@ -21,7 +21,9 @@ import { onRequestPost as handleCreateOrder } from '../functions/api/create-orde
 import { onRequestPost as handleVerifyPayment } from '../functions/api/verify-payment.js';
 import { onRequestPost as handleWebhook } from '../functions/api/razorpay-webhook.js';
 import { onRequestGet as handleDownload } from '../functions/api/download.js';
+import { onRequestPost as handleTestEmail } from '../functions/api/test-email.js';
 import { getS3PresignedUrl, verifyRazorpaySignature } from '../functions/api/_aws_s3.js';
+import { processOrderEmail, renderPurchaseEmail, escapeHtml } from '../functions/api/_email.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -32,6 +34,7 @@ class MockD1 {
   constructor() {
     this.orders = new Map();
     this.webhooks = new Map();
+    this.outbox = new Map();
   }
 
   prepare(query) {
@@ -66,8 +69,8 @@ class MockD1 {
               }
               return { success: true };
             }
-            const [payment_id, signature, token, rzp_order_id] = args;
-            const rec = this.orders.get(rzp_order_id) || Array.from(this.orders.values()).find(o => o.id === rzp_order_id);
+            const [payment_id, signature, token, rzp_order_id, targetOrderId] = args;
+            const rec = this.orders.get(rzp_order_id) || Array.from(this.orders.values()).find(o => o.id === rzp_order_id || o.id === targetOrderId);
             if (rec) {
               rec.status = 'paid';
               rec.razorpay_payment_id = payment_id;
@@ -93,17 +96,81 @@ class MockD1 {
             this.webhooks.set(event_id, { event_id, event_type, order_id, payment_id, payload });
             return { success: true };
           }
-          return { success: true };
+          if (q.startsWith('INSERT INTO email_outbox')) {
+            const [id, order_id, recipient_email, email_type, status, attempts] = args;
+            const key = `${order_id}_${email_type}`;
+            if (this.outbox.has(key)) {
+              throw new Error('UNIQUE constraint failed: email_outbox.order_id, email_outbox.email_type');
+            }
+            this.outbox.set(key, {
+              id,
+              order_id,
+              recipient_email,
+              email_type,
+              status: status || 'pending',
+              attempts: attempts || 0,
+              last_attempt_at: null,
+              sent_at: null,
+              error_message: null
+            });
+            return { success: true, meta: { changes: 1 } };
+          }
+          if (q.startsWith('UPDATE email_outbox') && q.includes("status = 'processing'")) {
+            const [order_id, email_type] = args;
+            const key = `${order_id}_${email_type}`;
+            const rec = this.outbox.get(key);
+            const isStale = rec && rec.status === 'processing' && rec.last_attempt_at && (Date.now() - new Date(rec.last_attempt_at).getTime() > 5 * 60 * 1000);
+            if (rec && (rec.status === 'pending' || rec.status === 'failed' || isStale) && rec.attempts < 3) {
+              rec.status = 'processing';
+              rec.attempts++;
+              rec.last_attempt_at = new Date().toISOString();
+              return { success: true, meta: { changes: 1 } };
+            }
+            return { success: true, meta: { changes: 0 } };
+          }
+          if (q.startsWith('UPDATE email_outbox') && q.includes("status = 'sent'")) {
+            const [order_id, email_type] = args;
+            const key = `${order_id}_${email_type}`;
+            const rec = this.outbox.get(key);
+            if (rec) {
+              rec.status = 'sent';
+              rec.sent_at = new Date().toISOString();
+              rec.error_message = null;
+              return { success: true, meta: { changes: 1 } };
+            }
+            return { success: true, meta: { changes: 0 } };
+          }
+          if (q.startsWith('UPDATE email_outbox') && q.includes("status = 'failed'")) {
+            const [err_msg, order_id, email_type] = args;
+            const key = `${order_id}_${email_type}`;
+            const rec = this.outbox.get(key);
+            if (rec) {
+              rec.status = 'failed';
+              rec.error_message = err_msg;
+              return { success: true, meta: { changes: 1 } };
+            }
+            return { success: true, meta: { changes: 0 } };
+          }
+          return { success: true, meta: { changes: 1 } };
         },
         first: async () => {
           if (q.includes('FROM orders')) {
-            const [orderId, , token] = args;
-            const rec = Array.from(this.orders.values()).find(o => (o.id === orderId || o.razorpay_order_id === orderId) && o.download_token === token);
+            const [orderId, rzpId, token] = args;
+            if (token !== undefined) {
+              const rec = Array.from(this.orders.values()).find(o => (o.id === orderId || o.razorpay_order_id === orderId) && o.download_token === token);
+              return rec || null;
+            }
+            const rec = Array.from(this.orders.values()).find(o => o.id === orderId || o.razorpay_order_id === orderId || o.id === rzpId || o.razorpay_order_id === rzpId);
             return rec || null;
           }
           if (q.includes('FROM webhook_logs')) {
             const [eventId] = args;
             return this.webhooks.get(eventId) || null;
+          }
+          if (q.includes('FROM email_outbox')) {
+            const [order_id, email_type] = args;
+            const key = `${order_id}_${email_type}`;
+            return this.outbox.get(key) || null;
           }
           return null;
         }
@@ -126,7 +193,13 @@ const mockEnv = {
   AWS_SECRET_ACCESS_KEY: 'mock_aws_secret_access_key_xyz_456',
   S3_PDF_KEY: 'Kids_Drawing_Book_Animals_School_Edition.pdf',
   DOWNLOAD_EXPIRY_SECONDS: '600',
-  SUPPORT_EMAIL: 'trenzy.helpme@gmail.com'
+  SUPPORT_EMAIL: 'trenzy.helpme@gmail.com',
+  SMTP_HOST: 'smtp.gmail.com',
+  SMTP_PORT: '465',
+  SMTP_SECURITY: 'Implicit TLS',
+  SMTP_FROM_EMAIL: 'order.trenzystore@gmail.com',
+  SMTP_USER: 'order.trenzystore@gmail.com',
+  SMTP_PASSWORD: 'test_mock_app_password_1234'
 };
 
 let passed = 0;
@@ -507,6 +580,382 @@ await test('analytics.js deduplicates Purchase event on repeat triggers', async 
   assert(js.includes('sessionStorage.getItem(storageKey)'), 'Must check sessionStorage for order deduplication');
   assert(js.includes('localStorage.getItem(storageKey)'), 'Must check localStorage for order deduplication');
   assert(js.includes("window.fbq('track', 'Purchase'"), 'Must track Meta Pixel Purchase');
+});
+
+// 7. POST-PURCHASE EMAIL DELIVERY & IDEMPOTENCY AUDIT
+console.log('\n[Audit Test 7: Post-Purchase Email Delivery & Idempotency]');
+
+await test('renderPurchaseEmail escapes customer values and generates required content', async () => {
+  const email = renderPurchaseEmail({
+    customerName: '<script>alert("xss")</script>Jane Doe',
+    orderId: 'ord_safe_123',
+    amount: '149',
+    currency: 'INR'
+  });
+  assert.equal(email.subject, 'Your Kids Drawing Book is Ready! Order Confirmation');
+  assert(email.text.includes('Hello <script>alert("xss")</script>Jane Doe'));
+  assert(email.text.includes('Amount: ₹149'));
+  assert(email.text.includes('Order ID: ord_safe_123'));
+  assert(email.html.includes('&lt;script&gt;alert(&quot;xss&quot;)&lt;/script&gt;Jane Doe'), 'Customer name must be HTML-escaped');
+  assert(!email.html.includes('<script>'), 'Must not contain unescaped script tag');
+  assert(email.html.includes('order.trenzystore@gmail.com'), 'Must include correct sender email');
+});
+
+await test('processOrderEmail refuses to send email for unpaid orders', async () => {
+  const unpaidOrderId = 'ord_unpaid_test_1';
+  mockDb.orders.set(unpaidOrderId, {
+    id: unpaidOrderId,
+    razorpay_order_id: 'rzp_unpaid_1',
+    customer_name: 'Unpaid Customer',
+    customer_email: 'unpaid@example.com',
+    amount: 14900,
+    currency: 'INR',
+    status: 'created'
+  });
+
+  const res = await processOrderEmail(unpaidOrderId, mockEnv);
+  assert.equal(res.success, false);
+  assert.equal(res.status, 'order_not_paid');
+  const outbox = mockDb.outbox.get(`${unpaidOrderId}_purchase_delivery`);
+  assert(!outbox, 'No outbox record should exist for unpaid order');
+});
+
+await test('processOrderEmail refuses to send email for failed payments', async () => {
+  const failedOrderId = 'ord_failed_test_email';
+  mockDb.orders.set(failedOrderId, {
+    id: failedOrderId,
+    razorpay_order_id: 'rzp_failed_email',
+    customer_name: 'Failed Customer',
+    customer_email: 'failed@example.com',
+    amount: 14900,
+    currency: 'INR',
+    status: 'failed'
+  });
+
+  const res = await processOrderEmail(failedOrderId, mockEnv);
+  assert.equal(res.success, false);
+  assert.equal(res.status, 'order_not_paid');
+});
+
+await test('processOrderEmail refuses to send email for invalid/missing recipient email', async () => {
+  const invalidEmailOrderId = 'ord_invalid_email_test';
+  mockDb.orders.set(invalidEmailOrderId, {
+    id: invalidEmailOrderId,
+    razorpay_order_id: 'rzp_invalid_email',
+    customer_name: 'Invalid Email Customer',
+    customer_email: 'not-an-email',
+    amount: 14900,
+    currency: 'INR',
+    status: 'paid'
+  });
+
+  const res = await processOrderEmail(invalidEmailOrderId, mockEnv);
+  assert.equal(res.success, false);
+  assert.equal(res.status, 'invalid_email');
+});
+
+// Mock PDF Buffer with valid %PDF- magic bytes
+const mockPdfBuffer = Buffer.from('%PDF-1.4 Mock PDF Content For Testing Purposes Only\n%%EOF');
+let lastSentMail = null;
+const mockTransportSuccess = async (mailOptions) => {
+  lastSentMail = mailOptions;
+  return { success: true, messageId: '<mock-msg-123@smtp.gmail.com>' };
+};
+
+await test('processOrderEmail sends email with PDF attachment after verified payment', async () => {
+  const paidOrderId = 'ord_paid_email_success';
+  mockDb.orders.set(paidOrderId, {
+    id: paidOrderId,
+    razorpay_order_id: 'rzp_paid_success',
+    customer_name: 'Sarah Connor',
+    customer_email: 'sarah.connor@example.com',
+    amount: 14900,
+    currency: 'INR',
+    status: 'paid'
+  });
+
+  const res = await processOrderEmail(paidOrderId, mockEnv, {
+    customTransport: mockTransportSuccess,
+    attachmentOverride: {
+      buffer: mockPdfBuffer,
+      filename: 'Kids_Drawing_Book_Animals_School_Edition.pdf',
+      contentType: 'application/pdf',
+      size: mockPdfBuffer.length
+    }
+  });
+
+  assert.equal(res.success, true);
+  assert.equal(res.status, 'sent');
+  assert(lastSentMail, 'Transport must have received email');
+  assert.equal(lastSentMail.to, 'sarah.connor@example.com', 'Recipient must match customer email');
+  assert.equal(lastSentMail.from, 'order.trenzystore@gmail.com', 'Sender must match order.trenzystore@gmail.com');
+  assert.equal(lastSentMail.subject, 'Your Kids Drawing Book is Ready! Order Confirmation');
+  assert(lastSentMail.attachment, 'Attachment must be present');
+  assert.equal(lastSentMail.attachment.filename, 'Kids_Drawing_Book_Animals_School_Edition.pdf');
+  assert.equal(lastSentMail.attachment.contentType, 'application/pdf');
+
+  const outbox = mockDb.outbox.get(`${paidOrderId}_purchase_delivery`);
+  assert(outbox, 'Outbox record must exist');
+  assert.equal(outbox.status, 'sent');
+  assert(outbox.sent_at, 'sent_at must be populated');
+  assert.equal(outbox.error_message, null);
+});
+
+await test('processOrderEmail prevents duplicate emails on re-execution (Idempotency)', async () => {
+  lastSentMail = null;
+  const res = await processOrderEmail('ord_paid_email_success', mockEnv, {
+    customTransport: mockTransportSuccess,
+    attachmentOverride: {
+      buffer: mockPdfBuffer,
+      filename: 'Kids_Drawing_Book_Animals_School_Edition.pdf',
+      contentType: 'application/pdf'
+    }
+  });
+
+  assert.equal(res.success, true);
+  assert.equal(res.status, 'already_sent');
+  assert.equal(lastSentMail, null, 'Custom transport must not have been called again');
+});
+
+await test('SMTP temporary failure records retryable status without altering paid order status', async () => {
+  const tempFailOrderId = 'ord_smtp_temp_fail';
+  mockDb.orders.set(tempFailOrderId, {
+    id: tempFailOrderId,
+    razorpay_order_id: 'rzp_temp_fail',
+    customer_name: 'John Doe',
+    customer_email: 'john@example.com',
+    amount: 14900,
+    currency: 'INR',
+    status: 'paid'
+  });
+
+  const mockTransportFail = async () => {
+    throw new Error('ETIMEDOUT: Connection to smtp.gmail.com timed out');
+  };
+
+  const res = await processOrderEmail(tempFailOrderId, mockEnv, {
+    customTransport: mockTransportFail,
+    attachmentOverride: {
+      buffer: mockPdfBuffer,
+      filename: 'Kids_Drawing_Book_Animals_School_Edition.pdf',
+      contentType: 'application/pdf'
+    }
+  });
+
+  assert.equal(res.success, false);
+  assert.equal(res.status, 'failed');
+
+  const outbox = mockDb.outbox.get(`${tempFailOrderId}_purchase_delivery`);
+  assert(outbox, 'Outbox record must exist');
+  assert.equal(outbox.status, 'failed');
+  assert.equal(outbox.attempts, 1);
+  assert(outbox.error_message.includes('ETIMEDOUT'));
+
+  // CRITICAL: Order status in orders table must remain 'paid'!
+  const orderRecord = mockDb.orders.get(tempFailOrderId);
+  assert.equal(orderRecord.status, 'paid', 'Order status must remain paid despite email delivery failure');
+});
+
+await test('Retry succeeds on subsequent attempt without requiring another payment', async () => {
+  const res = await processOrderEmail('ord_smtp_temp_fail', mockEnv, {
+    customTransport: mockTransportSuccess,
+    attachmentOverride: {
+      buffer: mockPdfBuffer,
+      filename: 'Kids_Drawing_Book_Animals_School_Edition.pdf',
+      contentType: 'application/pdf'
+    }
+  });
+
+  assert.equal(res.success, true);
+  assert.equal(res.status, 'sent');
+  const outbox = mockDb.outbox.get('ord_smtp_temp_fail_purchase_delivery');
+  assert.equal(outbox.status, 'sent');
+  assert.equal(outbox.attempts, 2);
+  assert.equal(outbox.error_message, null);
+});
+
+await test('processOrderEmail stops retrying when maximum attempts (3) exceeded', async () => {
+  const maxAttemptsOrderId = 'ord_max_attempts';
+  mockDb.orders.set(maxAttemptsOrderId, {
+    id: maxAttemptsOrderId,
+    razorpay_order_id: 'rzp_max_attempts',
+    customer_name: 'Max Retries',
+    customer_email: 'max@example.com',
+    amount: 14900,
+    currency: 'INR',
+    status: 'paid'
+  });
+  mockDb.outbox.set(`${maxAttemptsOrderId}_purchase_delivery`, {
+    id: `out_${maxAttemptsOrderId}_purchase_delivery`,
+    order_id: maxAttemptsOrderId,
+    recipient_email: 'max@example.com',
+    email_type: 'purchase_delivery',
+    status: 'failed',
+    attempts: 3
+  });
+
+  const res = await processOrderEmail(maxAttemptsOrderId, mockEnv);
+  assert.equal(res.success, false);
+  assert.equal(res.status, 'max_retries_exceeded');
+});
+
+await test('Existing browser PDF download continues working independently', async () => {
+  const req = { url: `http://localhost/api/download?order_id=${createdOrder.order_id}&token=${validToken}` };
+  const res = await handleDownload({ request: req, env: mockEnv });
+  assert.equal(res.status, 200);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.success, true);
+  assert(data.download_url.includes('X-Amz-Signature='), 'Presigned URL must still be generated');
+});
+
+await test('Stuck processing recovery: Reclaims stale processing records older than 5 minutes', async () => {
+  const staleOrderId = 'ord_stale_recovery_test';
+  mockDb.orders.set(staleOrderId, {
+    id: staleOrderId,
+    razorpay_order_id: 'rzp_stale_test',
+    customer_name: 'Stale Recovery',
+    customer_email: 'stale@example.com',
+    amount: 14900,
+    currency: 'INR',
+    status: 'paid'
+  });
+  // Simulate record stuck in 'processing' from 10 minutes ago
+  mockDb.outbox.set(`${staleOrderId}_purchase_delivery`, {
+    id: `out_${staleOrderId}_purchase_delivery`,
+    order_id: staleOrderId,
+    recipient_email: 'stale@example.com',
+    email_type: 'purchase_delivery',
+    status: 'processing',
+    attempts: 1,
+    last_attempt_at: new Date(Date.now() - 10 * 60 * 1000).toISOString()
+  });
+
+  const res = await processOrderEmail(staleOrderId, mockEnv, {
+    customTransport: mockTransportSuccess,
+    attachmentOverride: {
+      buffer: mockPdfBuffer,
+      filename: 'Kids_Drawing_Book_Animals_School_Edition.pdf',
+      contentType: 'application/pdf'
+    }
+  });
+
+  assert.equal(res.success, true);
+  assert.equal(res.status, 'sent');
+  const outbox = mockDb.outbox.get(`${staleOrderId}_purchase_delivery`);
+  assert.equal(outbox.status, 'sent');
+  assert.equal(outbox.attempts, 2);
+});
+
+await test('Duplicate concurrent workers: Safely skips active processing record', async () => {
+  const concurrentOrderId = 'ord_concurrent_worker_test';
+  mockDb.orders.set(concurrentOrderId, {
+    id: concurrentOrderId,
+    razorpay_order_id: 'rzp_concurrent_test',
+    customer_name: 'Concurrent Worker',
+    customer_email: 'concurrent@example.com',
+    amount: 14900,
+    currency: 'INR',
+    status: 'paid'
+  });
+  // Simulate active processing attempt from 30 seconds ago
+  mockDb.outbox.set(`${concurrentOrderId}_purchase_delivery`, {
+    id: `out_${concurrentOrderId}_purchase_delivery`,
+    order_id: concurrentOrderId,
+    recipient_email: 'concurrent@example.com',
+    email_type: 'purchase_delivery',
+    status: 'processing',
+    attempts: 1,
+    last_attempt_at: new Date(Date.now() - 30 * 1000).toISOString()
+  });
+
+  const res = await processOrderEmail(concurrentOrderId, mockEnv, {
+    customTransport: mockTransportSuccess,
+    attachmentOverride: {
+      buffer: mockPdfBuffer,
+      filename: 'Kids_Drawing_Book_Animals_School_Edition.pdf',
+      contentType: 'application/pdf'
+    }
+  });
+
+  assert.equal(res.success, true);
+  assert.equal(res.status, 'in_progress');
+});
+
+await test('SMTP authentication failure is recorded safely without affecting paid order status', async () => {
+  const authFailOrderId = 'ord_auth_fail_test';
+  mockDb.orders.set(authFailOrderId, {
+    id: authFailOrderId,
+    razorpay_order_id: 'rzp_auth_fail',
+    customer_name: 'Auth Fail',
+    customer_email: 'authfail@example.com',
+    amount: 14900,
+    currency: 'INR',
+    status: 'paid'
+  });
+
+  const mockTransportAuthFail = async () => {
+    throw new Error('535 5.7.8 Username and Password not accepted');
+  };
+
+  const res = await processOrderEmail(authFailOrderId, mockEnv, {
+    customTransport: mockTransportAuthFail,
+    attachmentOverride: {
+      buffer: mockPdfBuffer,
+      filename: 'Kids_Drawing_Book_Animals_School_Edition.pdf',
+      contentType: 'application/pdf'
+    }
+  });
+
+  assert.equal(res.success, false);
+  assert.equal(res.status, 'failed');
+  assert(res.error.includes('535 5.7.8'));
+
+  const outbox = mockDb.outbox.get(`${authFailOrderId}_purchase_delivery`);
+  assert.equal(outbox.status, 'failed');
+  assert(outbox.error_message.includes('535 5.7.8'));
+
+  // Paid status in orders table is strictly preserved
+  const orderRecord = mockDb.orders.get(authFailOrderId);
+  assert.equal(orderRecord.status, 'paid');
+});
+
+await test('Production configuration isolation: Default [vars] contains zero SMTP configuration', async () => {
+  const tomlContent = fs.readFileSync(path.join(ROOT_DIR, 'wrangler.toml'), 'utf8');
+  // Match top-level [vars] block until next section or EOF
+  const varsBlockMatch = tomlContent.match(/\[vars\]([\s\S]*?)(?:\[|$)/);
+  assert(varsBlockMatch, 'wrangler.toml must contain [vars] section');
+  const varsContent = varsBlockMatch[1];
+  assert(!varsContent.includes('SMTP_HOST'), 'Default [vars] must not contain SMTP_HOST');
+  assert(!varsContent.includes('SMTP_PORT'), 'Default [vars] must not contain SMTP_PORT');
+  assert(!varsContent.includes('SMTP_USER'), 'Default [vars] must not contain SMTP_USER');
+  assert(!varsContent.includes('SMTP_FROM_EMAIL'), 'Default [vars] must not contain SMTP_FROM_EMAIL');
+  assert(!varsContent.includes('SMTP_PASSWORD'), 'Default [vars] must not contain SMTP_PASSWORD');
+});
+
+await test('POST /api/test-email enforces staging isolation and token authorization', async () => {
+  // Test 1: Disabled in production
+  const prodReq = {
+    url: 'http://localhost/api/test-email?order_id=ord_test&token=some_token',
+    json: async () => ({})
+  };
+  const prodRes = await handleTestEmail({ request: prodReq, env: { ...mockEnv, ENVIRONMENT: 'production' } });
+  assert.equal(prodRes.status, 403);
+
+  // Test 2: Missing token returns 401
+  const noTokenReq = {
+    url: 'http://localhost/api/test-email?order_id=ord_test',
+    json: async () => ({})
+  };
+  const noTokenRes = await handleTestEmail({ request: noTokenReq, env: mockEnv });
+  assert.equal(noTokenRes.status, 401);
+
+  // Test 3: Invalid token returns 403
+  const badTokenReq = {
+    url: `http://localhost/api/test-email?order_id=${createdOrder.order_id}&token=bad_token`,
+    json: async () => ({})
+  };
+  const badTokenRes = await handleTestEmail({ request: badTokenReq, env: mockEnv });
+  assert.equal(badTokenRes.status, 403);
 });
 
 console.log('\n======================================================');

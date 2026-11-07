@@ -1,9 +1,12 @@
+import { processOrderEmail } from './_email.js';
+
 /**
  * POST /api/razorpay-webhook
  * Independently validates asynchronous payment notifications from Razorpay
  * Includes idempotency via webhook_logs table to prevent duplicate processing
  */
-export async function onRequestPost({ request, env }) {
+export async function onRequestPost(context) {
+  const { request, env, waitUntil } = context;
   try {
     // 1. Fail closed if webhook secret is not configured
     const webhookSecret = env.RAZORPAY_WEBHOOK_SECRET;
@@ -110,6 +113,20 @@ export async function onRequestPost({ request, env }) {
               updated_at = datetime('now')
           WHERE razorpay_order_id = ?
         `).bind(paymentId || '', downloadToken, orderId).run();
+
+        // Asynchronously dispatch purchase confirmation email with PDF attachment
+        try {
+          const emailPromise = processOrderEmail(orderId, env);
+          if (typeof waitUntil === 'function') {
+            waitUntil(emailPromise);
+          } else if (typeof context !== 'undefined' && context && typeof context.waitUntil === 'function') {
+            context.waitUntil(emailPromise);
+          } else {
+            await emailPromise;
+          }
+        } catch (emailErr) {
+          console.error('[Webhook Email Dispatch Error]:', emailErr.message);
+        }
       }
     } else if (eventType === 'payment.failed') {
       if (orderId && env.DB) {

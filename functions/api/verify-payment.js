@@ -1,10 +1,12 @@
 import { verifyRazorpaySignature } from './_aws_s3.js';
+import { processOrderEmail } from './_email.js';
 
 /**
  * POST /api/verify-payment
  * Verifies Razorpay HMAC signature, marks order paid in D1, and generates download token
  */
-export async function onRequestPost({ request, env }) {
+export async function onRequestPost(context) {
+  const { request, env, waitUntil } = context;
   try {
     const body = await request.json().catch(() => ({}));
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature, order_id } = body;
@@ -66,6 +68,17 @@ export async function onRequestPost({ request, env }) {
               updated_at = datetime('now')
           WHERE razorpay_order_id = ? OR id = ?
         `).bind(razorpay_payment_id, razorpay_signature || '', downloadToken, razorpay_order_id, targetOrderId).run();
+
+        // Asynchronously dispatch purchase confirmation email with PDF attachment
+        const emailPromise = processOrderEmail(targetOrderId, env);
+        if (typeof waitUntil === 'function') {
+          waitUntil(emailPromise);
+        } else if (typeof context !== 'undefined' && context && typeof context.waitUntil === 'function') {
+          context.waitUntil(emailPromise);
+        } else {
+          // Await in local test runners where waitUntil is not provided
+          await emailPromise;
+        }
       } catch (dbErr) {
         console.error('[D1 Verify Update Error]:', dbErr);
       }
