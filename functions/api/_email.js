@@ -108,7 +108,7 @@ export function renderPurchaseEmail({ customerName, orderId, amount, currency })
                   📎 Your purchased PDF is attached to this email.
                 </p>
                 <p style="margin:4px 0 0; font-size:13px; color:#555;">
-                  Filename: <code>Kids_Drawing_Book_Animals_School_Edition.pdf</code> (~14.4 MB)
+                  Filename: <code>Kids_Drawing_Book_Animals_School_Edition.pdf</code> (~1.2 MB)
                 </p>
               </div>
 
@@ -375,9 +375,107 @@ export async function sendSmtpEmail({
 }
 
 /**
+ * Allowed email types for post-purchase communications and testing
+ */
+export const ALLOWED_EMAIL_TYPES = Object.freeze(['purchase_delivery', 'staging_compressed_test']);
+
+export const EXPECTED_STAGING_BUCKET = 'kids-drawing-book-staging-441378339677';
+export const EXPECTED_STAGING_RAZORPAY_KEY = 'rzp_test_TuaqfpTw4hAqFw';
+
+/**
+ * Positively verifies whether the runtime environment is an authorized Preview / Staging environment.
+ * Multi-factor verification: Requires ALL of the following criteria to be met simultaneously:
+ * 1. Zero Production indicators (ENVIRONMENT !== 'production', NODE_ENV !== 'production', CF_PAGES_BRANCH !== 'main'/'master').
+ * 2. Positively verified staging branch (CF_PAGES_BRANCH === 'staging').
+ * 3. Exact matching Sydney staging bucket (AWS_S3_BUCKET === 'kids-drawing-book-staging-441378339677').
+ * 4. Exact matching staging Razorpay key (RAZORPAY_KEY_ID === 'rzp_test_TuaqfpTw4hAqFw').
+ * 5. Dedicated Preview-only encrypted secret binding (STAGING_PREVIEW_TOKEN) present, non-empty, and meeting minimum entropy requirements (>= 32 chars).
+ *
+ * Strictly fails closed if any required setting or secret binding is missing, empty, incorrect, or production.
+ * No secret value is hardcoded in source code, printed to logs, or returned in API responses.
+ */
+export function isPositivelyVerifiedPreview(env) {
+  if (!env || typeof env !== 'object') {
+    return false;
+  }
+
+  // 1. Explicit production indicators immediately disqualify
+  const envName = typeof env.ENVIRONMENT === 'string' ? env.ENVIRONMENT.trim().toLowerCase() : '';
+  const nodeEnv = typeof env.NODE_ENV === 'string' ? env.NODE_ENV.trim().toLowerCase() : '';
+  const pagesBranch = typeof env.CF_PAGES_BRANCH === 'string' ? env.CF_PAGES_BRANCH.trim() : '';
+
+  if (
+    envName === 'production' ||
+    nodeEnv === 'production' ||
+    pagesBranch.toLowerCase() === 'main' ||
+    pagesBranch.toLowerCase() === 'master'
+  ) {
+    return false;
+  }
+
+  // 2. Branch verification: Must be explicitly 'staging'
+  if (pagesBranch !== 'staging') {
+    return false;
+  }
+
+  // 3. Staging bucket verification: Must match the Sydney staging bucket exactly
+  const bucket = typeof env.AWS_S3_BUCKET === 'string' ? env.AWS_S3_BUCKET.trim() : (typeof env.Bucket === 'string' ? env.Bucket.trim() : '');
+  if (bucket !== EXPECTED_STAGING_BUCKET) {
+    return false;
+  }
+
+  // 4. Staging payment gateway verification: Must match the known staging Razorpay key ID exactly
+  const rzpKey = typeof env.RAZORPAY_KEY_ID === 'string' ? env.RAZORPAY_KEY_ID.trim() : '';
+  if (rzpKey !== EXPECTED_STAGING_RAZORPAY_KEY) {
+    return false;
+  }
+
+  // 5. Dedicated Preview-only encrypted secret binding verification
+  // Must be configured in Cloudflare Pages Preview secrets, non-empty, and >= 32 characters (high entropy)
+  const previewSecret = typeof env.STAGING_PREVIEW_TOKEN === 'string' ? env.STAGING_PREVIEW_TOKEN.trim() : '';
+  if (!previewSecret || previewSecret.length < 32) {
+    return false;
+  }
+
+  return true;
+}
+
+/**
  * Idempotent post-purchase email processor using Cloudflare D1 email_outbox table
  */
 export async function processOrderEmail(orderId, env, options = {}) {
+  // Gate 0: Validate email type before ANY database, outbox, or SMTP operation
+  const rawEmailType = options && options.emailType;
+  const emailType = (typeof rawEmailType === 'string' && rawEmailType.trim())
+    ? rawEmailType.trim()
+    : 'purchase_delivery';
+
+  if (!ALLOWED_EMAIL_TYPES.includes(emailType)) {
+    console.error(`[Email Outbox]: Disallowed email_type '${emailType}' for order ${orderId}`);
+    return { success: false, status: 'invalid_email_type', error: `Disallowed email type: ${emailType}` };
+  }
+
+  // Staging test email types require positive Preview verification AND controlled test invocation
+  if (emailType === 'staging_compressed_test') {
+    if (!options || options.isControlledTest !== true) {
+      console.error(`[Email Outbox]: Test email type '${emailType}' rejected. It is exclusively permitted via the controlled test endpoint.`);
+      return {
+        success: false,
+        status: 'unauthorized_caller',
+        error: 'staging_compressed_test is exclusively permitted via the controlled test endpoint.'
+      };
+    }
+
+    if (!isPositivelyVerifiedPreview(env)) {
+      console.error(`[Email Outbox]: Test email type '${emailType}' rejected. Environment is not a positively verified preview/staging environment.`);
+      return {
+        success: false,
+        status: 'disallowed_in_production',
+        error: 'Test email types require a positively verified Preview environment.'
+      };
+    }
+  }
+
   if (!env || !env.DB) {
     console.warn('[Email Outbox]: No D1 database bound. Skipping email processing.');
     return { success: false, status: 'no_db' };
@@ -407,7 +505,6 @@ export async function processOrderEmail(orderId, env, options = {}) {
     return { success: false, status: 'invalid_email' };
   }
 
-  const emailType = 'purchase_delivery';
   const outboxId = `out_${order.id}_${emailType}`;
 
   // 2. Check existing outbox record
@@ -475,13 +572,16 @@ export async function processOrderEmail(orderId, env, options = {}) {
     const smtpHost = (env.SMTP_HOST || 'smtp.gmail.com').trim();
     const smtpPort = parseInt(env.SMTP_PORT || '465', 10);
 
+    const activeTransport = options.customTransport || env.customTransport;
+    const activeAttachment = options.attachmentOverride || env.attachmentOverride;
+
     // If SMTP_PASSWORD is not configured and no custom test transport provided, fail safely
-    if (!smtpPass && !options.customTransport) {
+    if (!smtpPass && !activeTransport) {
       throw new Error('SMTP credentials not configured (SMTP_PASSWORD missing in environment secrets)');
     }
 
     // Retrieve PDF from S3 (or use attachment override for unit tests)
-    const attachment = options.attachmentOverride || (await fetchPdfFromS3(env));
+    const attachment = activeAttachment || (await fetchPdfFromS3(env));
 
     const { text, html, subject } = renderPurchaseEmail({
       customerName: order.customer_name || 'Valued Customer',
@@ -501,7 +601,7 @@ export async function processOrderEmail(orderId, env, options = {}) {
       text,
       html,
       attachment,
-      customTransport: options.customTransport
+      customTransport: activeTransport
     });
 
     // 5. Update outbox record to 'sent'

@@ -23,7 +23,15 @@ import { onRequestPost as handleWebhook } from '../functions/api/razorpay-webhoo
 import { onRequestGet as handleDownload } from '../functions/api/download.js';
 import { onRequestPost as handleTestEmail } from '../functions/api/test-email.js';
 import { getS3PresignedUrl, verifyRazorpaySignature } from '../functions/api/_aws_s3.js';
-import { processOrderEmail, renderPurchaseEmail, escapeHtml } from '../functions/api/_email.js';
+import {
+  processOrderEmail,
+  renderPurchaseEmail,
+  escapeHtml,
+  ALLOWED_EMAIL_TYPES,
+  isPositivelyVerifiedPreview,
+  EXPECTED_STAGING_BUCKET,
+  EXPECTED_STAGING_RAZORPAY_KEY
+} from '../functions/api/_email.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -599,6 +607,7 @@ await test('renderPurchaseEmail escapes customer values and generates required c
   assert(email.html.includes('&lt;script&gt;alert(&quot;xss&quot;)&lt;/script&gt;Jane Doe'), 'Customer name must be HTML-escaped');
   assert(!email.html.includes('<script>'), 'Must not contain unescaped script tag');
   assert(email.html.includes('order.trenzystore@gmail.com'), 'Must include correct sender email');
+  assert(email.html.includes('~1.2 MB'), 'Must include updated compressed PDF size note (~1.2 MB)');
 });
 
 await test('processOrderEmail refuses to send email for unpaid orders', async () => {
@@ -932,30 +941,440 @@ await test('Production configuration isolation: Default [vars] contains zero SMT
   assert(!varsContent.includes('SMTP_PASSWORD'), 'Default [vars] must not contain SMTP_PASSWORD');
 });
 
-await test('POST /api/test-email enforces staging isolation and token authorization', async () => {
-  // Test 1: Disabled in production
-  const prodReq = {
-    url: 'http://localhost/api/test-email?order_id=ord_test&token=some_token',
-    json: async () => ({})
-  };
-  const prodRes = await handleTestEmail({ request: prodReq, env: { ...mockEnv, ENVIRONMENT: 'production' } });
-  assert.equal(prodRes.status, 403);
+const dynamicTestPreviewSecret = 'preview_sec_' + Math.random().toString(36).substring(2) + '_' + Date.now().toString(36) + '_secure_token_8640';
 
-  // Test 2: Missing token returns 401
-  const noTokenReq = {
-    url: 'http://localhost/api/test-email?order_id=ord_test',
+const previewTestEnv = {
+  ...mockEnv,
+  CF_PAGES_BRANCH: 'staging',
+  AWS_S3_BUCKET: EXPECTED_STAGING_BUCKET,
+  AWS_REGION: 'ap-southeast-2',
+  RAZORPAY_KEY_ID: EXPECTED_STAGING_RAZORPAY_KEY,
+  STAGING_PREVIEW_TOKEN: dynamicTestPreviewSecret
+};
+
+await test('isPositivelyVerifiedPreview strictly enforces multi-factor preview verification and rejects permissive signals', async () => {
+  // Fail-closed 1: Missing or empty environment
+  assert.equal(isPositivelyVerifiedPreview(null), false, 'Null env must return false');
+  assert.equal(isPositivelyVerifiedPreview({}), false, 'Empty env must return false');
+  assert.equal(isPositivelyVerifiedPreview(mockEnv), false, 'Raw default mockEnv (production settings) must return false');
+
+  // Fail-closed 2: Permissive signals alone MUST NOT authorize preview
+  assert.equal(isPositivelyVerifiedPreview({ ENVIRONMENT: 'development' }), false, 'ENVIRONMENT=development alone must return false');
+  assert.equal(isPositivelyVerifiedPreview({ ENVIRONMENT: 'test' }), false, 'ENVIRONMENT=test alone must return false');
+  assert.equal(isPositivelyVerifiedPreview({ NODE_ENV: 'test' }), false, 'NODE_ENV=test alone must return false');
+  assert.equal(isPositivelyVerifiedPreview({ AWS_S3_BUCKET: EXPECTED_STAGING_BUCKET }), false, 'Staging S3 bucket alone must return false');
+  assert.equal(isPositivelyVerifiedPreview({ RAZORPAY_KEY_ID: EXPECTED_STAGING_RAZORPAY_KEY }), false, 'Staging Razorpay key alone must return false');
+  assert.equal(isPositivelyVerifiedPreview({ CF_PAGES_BRANCH: 'staging' }), false, 'Branch alone without bucket and key must return false');
+
+  // Fail-closed 3: Missing branch (even with correct bucket, key and secret)
+  assert.equal(isPositivelyVerifiedPreview({
+    AWS_S3_BUCKET: EXPECTED_STAGING_BUCKET,
+    RAZORPAY_KEY_ID: EXPECTED_STAGING_RAZORPAY_KEY,
+    STAGING_PREVIEW_TOKEN: dynamicTestPreviewSecret
+  }), false, 'Missing branch must return false');
+
+  // Fail-closed 4: Wrong branch
+  assert.equal(isPositivelyVerifiedPreview({
+    ...previewTestEnv,
+    CF_PAGES_BRANCH: 'feature-test'
+  }), false, 'Wrong branch must return false');
+
+  // Fail-closed 5: Production branch (main or master)
+  assert.equal(isPositivelyVerifiedPreview({
+    ...previewTestEnv,
+    CF_PAGES_BRANCH: 'main'
+  }), false, 'Production branch main must return false');
+  assert.equal(isPositivelyVerifiedPreview({
+    ...previewTestEnv,
+    CF_PAGES_BRANCH: 'master'
+  }), false, 'Production branch master must return false');
+
+  // Fail-closed 6: Correct staging branch but wrong bucket
+  assert.equal(isPositivelyVerifiedPreview({
+    ...previewTestEnv,
+    AWS_S3_BUCKET: 'inkframepress-private-ebooks-442189079113-ap-south-1-an'
+  }), false, 'Correct branch with wrong bucket must return false');
+
+  // Fail-closed 7: Correct staging branch but wrong Razorpay key
+  assert.equal(isPositivelyVerifiedPreview({
+    ...previewTestEnv,
+    RAZORPAY_KEY_ID: 'rzp_test_placeholder'
+  }), false, 'Correct branch with wrong key must return false');
+
+  // Fail-closed 8: Production environment with accidental staging credentials
+  assert.equal(isPositivelyVerifiedPreview({
+    ...previewTestEnv,
+    ENVIRONMENT: 'production'
+  }), false, 'ENVIRONMENT=production must override and return false');
+  assert.equal(isPositivelyVerifiedPreview({
+    ...previewTestEnv,
+    NODE_ENV: 'production'
+  }), false, 'NODE_ENV=production must override and return false');
+
+  // Fail-closed 9: Missing Preview secret binding
+  assert.equal(isPositivelyVerifiedPreview({
+    CF_PAGES_BRANCH: 'staging',
+    AWS_S3_BUCKET: EXPECTED_STAGING_BUCKET,
+    RAZORPAY_KEY_ID: EXPECTED_STAGING_RAZORPAY_KEY,
+    STAGING_PREVIEW_TOKEN: ''
+  }), false, 'Empty STAGING_PREVIEW_TOKEN must return false');
+  assert.equal(isPositivelyVerifiedPreview({
+    CF_PAGES_BRANCH: 'staging',
+    AWS_S3_BUCKET: EXPECTED_STAGING_BUCKET,
+    RAZORPAY_KEY_ID: EXPECTED_STAGING_RAZORPAY_KEY,
+    STAGING_PREVIEW_TOKEN: undefined
+  }), false, 'Missing STAGING_PREVIEW_TOKEN must return false');
+
+  // Fail-closed 10: Incorrect / weak Preview secret (< 32 characters)
+  assert.equal(isPositivelyVerifiedPreview({
+    CF_PAGES_BRANCH: 'staging',
+    AWS_S3_BUCKET: EXPECTED_STAGING_BUCKET,
+    RAZORPAY_KEY_ID: EXPECTED_STAGING_RAZORPAY_KEY,
+    STAGING_PREVIEW_TOKEN: 'short_weak_token'
+  }), false, 'Incorrect/short STAGING_PREVIEW_TOKEN must return false');
+
+  // Success: Correct Preview secret and complete staging configuration
+  assert.equal(isPositivelyVerifiedPreview(previewTestEnv), true, 'Complete valid staging configuration with secure Preview secret must return true');
+});
+
+await test('POST /api/test-email enforces strict fail-closed staging isolation and token authorization', async () => {
+  const authorizedUrl = `http://localhost/api/test-email?order_id=${createdOrder.order_id}&token=${validToken}`;
+  const validReq = {
+    url: authorizedUrl,
+    method: 'POST',
     json: async () => ({})
   };
-  const noTokenRes = await handleTestEmail({ request: noTokenReq, env: mockEnv });
+
+  // Fail-closed Test 1: Missing ENVIRONMENT (raw production [vars] mockEnv)
+  const missingEnvRes = await handleTestEmail({ request: validReq, env: mockEnv });
+  assert.equal(missingEnvRes.status, 403, 'Missing ENVIRONMENT must fail closed with 403');
+  const missingEnvData = JSON.parse(await missingEnvRes.text());
+  assert(missingEnvData.error.includes('positively verified staging or preview'));
+
+  // Fail-closed Test 2: Unknown or arbitrary ENVIRONMENT string
+  const unknownEnvRes = await handleTestEmail({ request: validReq, env: { ...mockEnv, ENVIRONMENT: 'unknown' } });
+  assert.equal(unknownEnvRes.status, 403, 'Unknown ENVIRONMENT must fail closed with 403');
+
+  // Fail-closed Test 3: Explicit production environment (ENVIRONMENT = production)
+  const prodRes = await handleTestEmail({ request: validReq, env: { ...mockEnv, ENVIRONMENT: 'production' } });
+  assert.equal(prodRes.status, 403, 'ENVIRONMENT=production must return 403');
+
+  // Fail-closed Test 4: Explicit production environment (NODE_ENV = production)
+  const prodNodeRes = await handleTestEmail({ request: validReq, env: { ...mockEnv, NODE_ENV: 'production' } });
+  assert.equal(prodNodeRes.status, 403, 'NODE_ENV=production must return 403');
+
+  // Fail-closed Test 5: Production Git branch (CF_PAGES_BRANCH = main)
+  const mainBranchRes = await handleTestEmail({ request: validReq, env: { ...mockEnv, CF_PAGES_BRANCH: 'main' } });
+  assert.equal(mainBranchRes.status, 403, 'CF_PAGES_BRANCH=main must return 403');
+
+  // Fail-closed Test 6: Missing Preview secret binding
+  const missingSecretRes = await handleTestEmail({
+    request: validReq,
+    env: { ...previewTestEnv, STAGING_PREVIEW_TOKEN: undefined }
+  });
+  assert.equal(missingSecretRes.status, 403, 'Missing STAGING_PREVIEW_TOKEN must return 403');
+
+  // Fail-closed Test 7: Incorrect client Preview secret
+  const badClientSecretReq = {
+    url: `${authorizedUrl}&preview_token=wrong_client_secret`,
+    method: 'POST',
+    json: async () => ({})
+  };
+  const badClientSecretRes = await handleTestEmail({ request: badClientSecretReq, env: previewTestEnv });
+  assert.equal(badClientSecretRes.status, 403, 'Incorrect client preview_token must return 403');
+  const badSecretData = JSON.parse(await badClientSecretRes.text());
+  assert(badSecretData.error.includes('Incorrect Preview secret'));
+
+  // Fail-closed Test 8: Completely empty environment object
+  const emptyRes = await handleTestEmail({ request: validReq, env: {} });
+  assert.equal(emptyRes.status, 403, 'Empty env must return 403');
+
+  // Fail-closed Test 9: Null environment
+  const nullRes = await handleTestEmail({ request: validReq, env: null });
+  assert.equal(nullRes.status, 403, 'Null env must return 403');
+
+  // Authorization Test 10: Missing token in positively verified preview returns 401
+  const noTokenReq = {
+    url: `http://localhost/api/test-email?order_id=${createdOrder.order_id}`,
+    method: 'POST',
+    json: async () => ({})
+  };
+  const noTokenRes = await handleTestEmail({ request: noTokenReq, env: previewTestEnv });
   assert.equal(noTokenRes.status, 401);
 
-  // Test 3: Invalid token returns 403
-  const badTokenReq = {
-    url: `http://localhost/api/test-email?order_id=${createdOrder.order_id}&token=bad_token`,
+  // Authorization Test 11: Missing order_id in positively verified preview returns 401
+  const noOrderReq = {
+    url: `http://localhost/api/test-email?token=${validToken}`,
+    method: 'POST',
     json: async () => ({})
   };
-  const badTokenRes = await handleTestEmail({ request: badTokenReq, env: mockEnv });
+  const noOrderRes = await handleTestEmail({ request: noOrderReq, env: previewTestEnv });
+  assert.equal(noOrderRes.status, 401);
+
+  // Authorization Test 12: Invalid token in positively verified preview returns 403
+  const badTokenReq = {
+    url: `http://localhost/api/test-email?order_id=${createdOrder.order_id}&token=bad_token`,
+    method: 'POST',
+    json: async () => ({})
+  };
+  const badTokenRes = await handleTestEmail({ request: badTokenReq, env: previewTestEnv });
   assert.equal(badTokenRes.status, 403);
+
+  // Authorization Test 13: Non-existent order in positively verified preview returns 403
+  const missingOrderReq = {
+    url: 'http://localhost/api/test-email?order_id=ord_nonexistent_999&token=any_token',
+    method: 'POST',
+    json: async () => ({})
+  };
+  const missingOrderRes = await handleTestEmail({ request: missingOrderReq, env: previewTestEnv });
+  assert.equal(missingOrderRes.status, 403);
+});
+
+await test('Normal checkout defaults strictly to purchase_delivery email_type', async () => {
+  const normalOrderId = 'ord_normal_checkout_type';
+  mockDb.orders.set(normalOrderId, {
+    id: normalOrderId,
+    razorpay_order_id: 'rzp_normal_type',
+    customer_name: 'Normal Checkout User',
+    customer_email: 'normal@example.com',
+    amount: 14900,
+    currency: 'INR',
+    status: 'paid'
+  });
+
+  const res = await processOrderEmail(normalOrderId, mockEnv, {
+    customTransport: mockTransportSuccess,
+    attachmentOverride: {
+      buffer: mockPdfBuffer,
+      filename: 'Kids_Drawing_Book_Animals_School_Edition.pdf',
+      contentType: 'application/pdf'
+    }
+  });
+
+  assert.equal(res.success, true);
+  assert.equal(res.status, 'sent');
+  const outbox = mockDb.outbox.get(`${normalOrderId}_purchase_delivery`);
+  assert(outbox, 'Must create purchase_delivery outbox record');
+  assert.equal(outbox.email_type, 'purchase_delivery');
+  assert.equal(outbox.status, 'sent');
+  assert.equal(outbox.id, `out_${normalOrderId}_purchase_delivery`);
+});
+
+await test('Controlled test endpoint defaults strictly to staging_compressed_test email_type', async () => {
+  const testOrderId = 'ord_controlled_staging_test';
+  const testToken = 'token_test_staging_compressed_123';
+  mockDb.orders.set(testOrderId, {
+    id: testOrderId,
+    razorpay_order_id: 'rzp_test_staging_compressed',
+    customer_name: 'Compressed Staging User',
+    customer_email: 'compressed.test@example.com',
+    amount: 14900,
+    currency: 'INR',
+    status: 'paid',
+    download_token: testToken
+  });
+
+  const testEnv = {
+    ...previewTestEnv,
+    customTransport: mockTransportSuccess,
+    attachmentOverride: {
+      buffer: mockPdfBuffer,
+      filename: 'Kids_Drawing_Book_Animals_School_Edition.pdf',
+      contentType: 'application/pdf'
+    }
+  };
+
+  const req = {
+    url: `http://localhost/api/test-email?order_id=${testOrderId}&token=${testToken}`,
+    method: 'POST',
+    json: async () => ({})
+  };
+
+  const res = await handleTestEmail({ request: req, env: testEnv });
+  assert.equal(res.status, 200);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.success, true);
+  assert.equal(data.status, 'sent');
+  assert.equal(data.email_type, 'staging_compressed_test');
+  assert.equal(data.order_id, testOrderId);
+
+  const outbox = mockDb.outbox.get(`${testOrderId}_staging_compressed_test`);
+  assert(outbox, 'Must create staging_compressed_test outbox record');
+  assert.equal(outbox.email_type, 'staging_compressed_test');
+  assert.equal(outbox.status, 'sent');
+  assert.equal(outbox.id, `out_${testOrderId}_staging_compressed_test`);
+});
+
+await test('The two outbox records (purchase_delivery and staging_compressed_test) remain completely independent', async () => {
+  const dualOrderId = 'ord_dual_record_test';
+  const dualToken = 'token_dual_record_456';
+  mockDb.orders.set(dualOrderId, {
+    id: dualOrderId,
+    razorpay_order_id: 'rzp_dual_record',
+    customer_name: 'Dual Record User',
+    customer_email: 'dual@example.com',
+    amount: 14900,
+    currency: 'INR',
+    status: 'paid',
+    download_token: dualToken
+  });
+
+  const testEnv = {
+    ...previewTestEnv,
+    customTransport: mockTransportSuccess,
+    attachmentOverride: {
+      buffer: mockPdfBuffer,
+      filename: 'Kids_Drawing_Book_Animals_School_Edition.pdf',
+      contentType: 'application/pdf'
+    }
+  };
+
+  // Step 1: Send initial purchase_delivery email (e.g. historical purchase)
+  const res1 = await processOrderEmail(dualOrderId, testEnv, {
+    emailType: 'purchase_delivery'
+  });
+  assert.equal(res1.success, true);
+  assert.equal(res1.status, 'sent');
+
+  const purchaseRecord = mockDb.outbox.get(`${dualOrderId}_purchase_delivery`);
+  assert(purchaseRecord, 'purchase_delivery record must exist');
+  assert.equal(purchaseRecord.status, 'sent');
+  assert.equal(purchaseRecord.email_type, 'purchase_delivery');
+  const originalPurchaseSentAt = purchaseRecord.sent_at;
+
+  // Step 2: Trigger staging compressed PDF test via POST /api/test-email
+  const req = {
+    url: `http://localhost/api/test-email?order_id=${dualOrderId}&token=${dualToken}`,
+    method: 'POST',
+    json: async () => ({})
+  };
+  const res2 = await handleTestEmail({ request: req, env: testEnv });
+  assert.equal(res2.status, 200);
+  const data2 = JSON.parse(await res2.text());
+  assert.equal(data2.success, true);
+  assert.equal(data2.status, 'sent');
+  assert.equal(data2.email_type, 'staging_compressed_test');
+
+  // Step 3: Verify both records exist simultaneously and neither altered the other
+  const testRecord = mockDb.outbox.get(`${dualOrderId}_staging_compressed_test`);
+  assert(testRecord, 'staging_compressed_test record must exist');
+  assert.equal(testRecord.status, 'sent');
+  assert.equal(testRecord.email_type, 'staging_compressed_test');
+  assert.equal(testRecord.id, `out_${dualOrderId}_staging_compressed_test`);
+
+  // Verify original purchase record is completely untouched
+  const untouchedPurchaseRecord = mockDb.outbox.get(`${dualOrderId}_purchase_delivery`);
+  assert.equal(untouchedPurchaseRecord.status, 'sent');
+  assert.equal(untouchedPurchaseRecord.sent_at, originalPurchaseSentAt);
+  assert.equal(untouchedPurchaseRecord.id, `out_${dualOrderId}_purchase_delivery`);
+});
+
+await test('Duplicate test requests do not send duplicate emails (Idempotency for staging_compressed_test)', async () => {
+  lastSentMail = null;
+  const testOrderId = 'ord_controlled_staging_test';
+  const testToken = 'token_test_staging_compressed_123';
+
+  const testEnv = {
+    ...previewTestEnv,
+    customTransport: mockTransportSuccess,
+    attachmentOverride: {
+      buffer: mockPdfBuffer,
+      filename: 'Kids_Drawing_Book_Animals_School_Edition.pdf',
+      contentType: 'application/pdf'
+    }
+  };
+
+  const req = {
+    url: `http://localhost/api/test-email?order_id=${testOrderId}&token=${testToken}`,
+    method: 'POST',
+    json: async () => ({})
+  };
+
+  const res = await handleTestEmail({ request: req, env: testEnv });
+  assert.equal(res.status, 200);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.success, true);
+  assert.equal(data.status, 'already_sent');
+  assert.equal(data.email_type, 'staging_compressed_test');
+  assert.equal(lastSentMail, null, 'Custom transport must not be called again on duplicate test request');
+});
+
+await test('Arbitrary email types are strictly rejected by both backend processor and test endpoint', async () => {
+  const paidOrderId = 'ord_paid_email_success';
+  const validToken = 'valid_token_xyz_123';
+  mockDb.orders.get(paidOrderId).download_token = validToken;
+
+  // 1. processOrderEmail rejects arbitrary emailType
+  const badTypeRes = await processOrderEmail(paidOrderId, previewTestEnv, { emailType: 'unauthorized_newsletter' });
+  assert.equal(badTypeRes.success, false);
+  assert.equal(badTypeRes.status, 'invalid_email_type');
+
+  // 2. processOrderEmail strictly rejects staging test type in production environment (even with isControlledTest)
+  const prodTypeRes = await processOrderEmail(paidOrderId, { ...mockEnv, ENVIRONMENT: 'production' }, { emailType: 'staging_compressed_test', isControlledTest: true });
+  assert.equal(prodTypeRes.success, false);
+  assert.equal(prodTypeRes.status, 'disallowed_in_production');
+
+  // 2b. processOrderEmail strictly rejects staging test type in missing environment (fail-closed, even with isControlledTest)
+  const missingEnvTypeRes = await processOrderEmail(paidOrderId, mockEnv, { emailType: 'staging_compressed_test', isControlledTest: true });
+  assert.equal(missingEnvTypeRes.success, false);
+  assert.equal(missingEnvTypeRes.status, 'disallowed_in_production');
+
+  // 2c. processOrderEmail strictly rejects staging test type when isControlledTest flag is missing (cannot be triggered via checkout)
+  const noFlagRes = await processOrderEmail(paidOrderId, previewTestEnv, { emailType: 'staging_compressed_test' });
+  assert.equal(noFlagRes.success, false);
+  assert.equal(noFlagRes.status, 'unauthorized_caller');
+  assert(noFlagRes.error.includes('controlled test endpoint'));
+
+  // 3. /api/test-email rejects arbitrary requested email_type with HTTP 400
+  const reqBadType = {
+    url: `http://localhost/api/test-email?order_id=${paidOrderId}&token=${validToken}&email_type=malicious_type`,
+    method: 'POST',
+    json: async () => ({})
+  };
+  const resBadType = await handleTestEmail({ request: reqBadType, env: previewTestEnv });
+  assert.equal(resBadType.status, 400);
+  const dataBad = JSON.parse(await resBadType.text());
+  assert.equal(dataBad.success, false);
+  assert(dataBad.error.includes('Invalid test email type'));
+
+  // 4. /api/test-email strictly rejects 'purchase_delivery' with HTTP 400
+  const reqPurchaseDelivery = {
+    url: `http://localhost/api/test-email?order_id=${paidOrderId}&token=${validToken}&email_type=purchase_delivery`,
+    method: 'POST',
+    json: async () => ({})
+  };
+  const resPurchaseDelivery = await handleTestEmail({ request: reqPurchaseDelivery, env: previewTestEnv });
+  assert.equal(resPurchaseDelivery.status, 400);
+  const dataPurchaseDelivery = JSON.parse(await resPurchaseDelivery.text());
+  assert.equal(dataPurchaseDelivery.success, false);
+  assert(dataPurchaseDelivery.error.includes("'purchase_delivery' and arbitrary types are rejected"));
+});
+
+await test('POST /api/test-email rejects unpaid orders and non-existent orders', async () => {
+  const unpaidOrderId = 'ord_unpaid_test_email_endpoint';
+  const unpaidToken = 'token_unpaid_abc';
+  mockDb.orders.set(unpaidOrderId, {
+    id: unpaidOrderId,
+    razorpay_order_id: 'rzp_unpaid_endpoint',
+    customer_name: 'Unpaid User',
+    customer_email: 'unpaid.user@example.com',
+    amount: 14900,
+    currency: 'INR',
+    status: 'created',
+    download_token: unpaidToken
+  });
+
+  // Test unpaid order rejection (HTTP 400)
+  const reqUnpaid = {
+    url: `http://localhost/api/test-email?order_id=${unpaidOrderId}&token=${unpaidToken}`,
+    method: 'POST',
+    json: async () => ({})
+  };
+  const resUnpaid = await handleTestEmail({ request: reqUnpaid, env: previewTestEnv });
+  assert.equal(resUnpaid.status, 400);
+  const dataUnpaid = JSON.parse(await resUnpaid.text());
+  assert.equal(dataUnpaid.success, false);
+  assert(dataUnpaid.error.includes("Order status is 'created'"));
 });
 
 console.log('\n======================================================');
