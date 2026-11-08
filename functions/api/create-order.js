@@ -63,13 +63,13 @@ export async function onRequestPost({ request, env }) {
 
     const localOrderId = `ord_${Date.now()}`;
 
-    // Store in Cloudflare D1 if binding exists
+    // Store in Cloudflare D1 if binding exists (stored in Rupees for clear accounting)
     if (env.DB) {
       try {
         await env.DB.prepare(`
           INSERT INTO orders (id, razorpay_order_id, customer_name, customer_email, customer_phone, amount, currency, status)
           VALUES (?, ?, ?, ?, ?, ?, ?, 'created')
-        `).bind(localOrderId, razorpayOrderId, name || '', email, phone || '', amountInPaise, currency).run();
+        `).bind(localOrderId, razorpayOrderId, name || '', email, phone || '', price, currency).run();
       } catch (dbErr) {
         console.warn('[D1 Order Insert Warning]:', dbErr.message);
       }

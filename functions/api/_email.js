@@ -16,12 +16,13 @@ export function escapeHtml(str) {
 /**
  * Generates plain-text and HTML email content for purchased e-book delivery
  */
-export function renderPurchaseEmail({ customerName, orderId, amount, currency }) {
+export function renderPurchaseEmail({ customerName, orderId, amount, currency, supportEmail } = {}) {
   const safeName = customerName && customerName.trim() ? customerName.trim() : 'Valued Customer';
   const escapedName = escapeHtml(safeName);
   const safeOrderId = escapeHtml(orderId);
   const safeAmount = escapeHtml(amount || '149');
   const safeCurrency = escapeHtml(currency || 'INR');
+  const safeSupportEmail = escapeHtml(supportEmail && supportEmail.trim() ? supportEmail.trim() : 'trenzy.helpme@gmail.com');
 
   const subject = 'Your Kids Drawing Book is Ready! Order Confirmation';
 
@@ -43,7 +44,7 @@ export function renderPurchaseEmail({ customerName, orderId, amount, currency })
     '',
     `Regards,`,
     `Kids Drawing Book Team`,
-    `order.trenzystore@gmail.com`
+    safeSupportEmail
   ].join('\r\n');
 
   const html = `<!DOCTYPE html>
@@ -118,7 +119,7 @@ export function renderPurchaseEmail({ customerName, orderId, amount, currency })
               
               <p style="font-size:14px; color:#555; margin:0 0 4px;">Regards,</p>
               <p style="font-size:15px; font-weight:700; color:#2c3e50; margin:0 0 2px;">Kids Drawing Book Team</p>
-              <p style="font-size:13px; color:#888; margin:0;"><a href="mailto:order.trenzystore@gmail.com" style="color:#FF914D; text-decoration:none;">order.trenzystore@gmail.com</a></p>
+              <p style="font-size:13px; color:#888; margin:0;"><a href="mailto:${safeSupportEmail}" style="color:#FF914D; text-decoration:none;">${safeSupportEmail}</a></p>
             </td>
           </tr>
         </table>
@@ -583,11 +584,17 @@ export async function processOrderEmail(orderId, env, options = {}) {
     // Retrieve PDF from S3 (or use attachment override for unit tests)
     const attachment = activeAttachment || (await fetchPdfFromS3(env));
 
+    const supportEmail = (env.SUPPORT_EMAIL || 'trenzy.helpme@gmail.com').trim();
+    const displayAmount = (order.amount && Number(order.amount) >= 1000)
+      ? (Number(order.amount) / 100).toFixed(0)
+      : String(order.amount || '149');
+
     const { text, html, subject } = renderPurchaseEmail({
       customerName: order.customer_name || 'Valued Customer',
       orderId: order.id,
-      amount: (order.amount / 100).toFixed(0),
-      currency: order.currency || 'INR'
+      amount: displayAmount,
+      currency: order.currency || 'INR',
+      supportEmail
     });
 
     const sendResult = await sendSmtpEmail({

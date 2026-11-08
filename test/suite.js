@@ -278,9 +278,11 @@ await test('POST /api/create-order creates order with server-enforced amount', a
   const res = await handleCreateOrder({ request: req, env: mockEnv });
   assert.equal(res.status, 200);
   createdOrder = JSON.parse(await res.text());
-  assert.equal(createdOrder.amount, 14900); // 149 INR in paise
+  assert.equal(createdOrder.amount, 14900); // 149 INR in paise for Razorpay
   assert.equal(createdOrder.currency, 'INR');
   assert(createdOrder.razorpay_order_id, 'Missing razorpay_order_id');
+  const storedDbOrder = mockEnv.DB.orders.get(createdOrder.razorpay_order_id);
+  assert.equal(storedDbOrder.amount, 149, 'D1 order record must store amount in rupees (149)');
 });
 
 await test('POST /api/create-order blocks requests without valid email', async () => {
@@ -606,7 +608,8 @@ await test('renderPurchaseEmail escapes customer values and generates required c
   assert(email.text.includes('Order ID: ord_safe_123'));
   assert(email.html.includes('&lt;script&gt;alert(&quot;xss&quot;)&lt;/script&gt;Jane Doe'), 'Customer name must be HTML-escaped');
   assert(!email.html.includes('<script>'), 'Must not contain unescaped script tag');
-  assert(email.html.includes('order.trenzystore@gmail.com'), 'Must include correct sender email');
+  assert(email.html.includes('trenzy.helpme@gmail.com'), 'Must include correct support email');
+  assert(email.text.includes('trenzy.helpme@gmail.com'), 'Must include correct support email in plain text');
   assert(email.html.includes('~1.2 MB'), 'Must include updated compressed PDF size note (~1.2 MB)');
 });
 

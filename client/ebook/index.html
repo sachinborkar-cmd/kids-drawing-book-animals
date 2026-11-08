@@ -605,7 +605,7 @@
   <!-- Customer Details & Checkout Modal -->
   <div id="checkout-modal" class="lightbox-modal" role="dialog" aria-modal="true" aria-label="Checkout Window">
     <div class="lightbox-box checkout-modal-box" style="text-align: left;">
-      <button id="checkout-close" class="lightbox-close" aria-label="Close checkout">&times;</button>
+      <button id="checkout-close" class="lightbox-close checkout-close-btn" aria-label="Close checkout" type="button">&times;</button>
 
       <div style="display:flex; align-items:center; gap:12px; margin-bottom:16px;">
         <img src="/assets/images/book-cover.png" alt="Book cover" style="width:50px; height:70px; object-fit:contain; border-radius:6px; box-shadow:0 4px 10px rgba(0,0,0,0.1);">
@@ -636,7 +636,7 @@
 
         <div id="checkout-error" style="display:none; color:#c0392b; font-size:0.85rem; background:#fde8e8; padding:8px 12px; border-radius:6px;"></div>
 
-        <button type="submit" id="checkout-submit-btn" class="btn btn-primary btn-lg" style="width:100%; margin-top:6px;">
+        <button type="submit" id="checkout-submit-btn" class="btn btn-primary btn-lg btn-checkout-submit" style="width:100%; margin-top:6px;">
           Proceed to Pay • <span data-product-price>₹149</span>
         </button>
 
