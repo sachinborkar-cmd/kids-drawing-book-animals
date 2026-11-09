@@ -22,9 +22,15 @@ import { onRequestPost as handleVerifyPayment } from '../functions/api/verify-pa
 import { onRequestPost as handleWebhook } from '../functions/api/razorpay-webhook.js';
 import { onRequestGet as handleDownload } from '../functions/api/download.js';
 import { onRequestPost as handleTestEmail } from '../functions/api/test-email.js';
-import { getS3PresignedUrl, verifyRazorpaySignature } from '../functions/api/_aws_s3.js';
+import {
+  getS3PresignedUrl,
+  verifyRazorpaySignature,
+  getValidatedS3Config,
+  AUTHORIZED_S3_CONFIGS
+} from '../functions/api/_aws_s3.js';
 import {
   processOrderEmail,
+  fetchPdfFromS3,
   renderPurchaseEmail,
   escapeHtml,
   ALLOWED_EMAIL_TYPES,
@@ -190,6 +196,7 @@ class MockD1 {
 const mockDb = new MockD1();
 const mockEnv = {
   DB: mockDb,
+  CF_PAGES_BRANCH: 'main',
   PRODUCT_PRICE: '149',
   PRODUCT_CURRENCY: 'INR',
   RAZORPAY_KEY_ID: 'rzp_test_placeholder',
@@ -567,6 +574,8 @@ await test('GET /api/download fails closed if AWS credentials are unset', async 
 await test('GET /api/download correctly supports Sydney staging bucket and dashboard alias overrides', async () => {
   const stagingEnv = {
     ...mockEnv,
+    CF_PAGES_BRANCH: 'staging',
+    ENVIRONMENT: 'staging',
     AWS_S3_BUCKET: undefined,
     AWS_REGION: undefined,
     S3_PDF_KEY: undefined,
@@ -581,6 +590,131 @@ await test('GET /api/download correctly supports Sydney staging bucket and dashb
   assert.equal(data.success, true);
   assert(data.download_url.includes('kids-drawing-book-staging-441378339677.s3.ap-southeast-2.amazonaws.com'), 'Host must match Sydney staging bucket');
   assert(data.download_url.includes('ap-southeast-2%2Fs3%2Faws4_request'), 'Credential scope must reflect ap-southeast-2');
+});
+
+await test('getValidatedS3Config rejects missing AWS_S3_BUCKET', () => {
+  assert.throws(() => {
+    getValidatedS3Config({
+      CF_PAGES_BRANCH: 'main',
+      AWS_REGION: 'ap-south-1'
+    });
+  }, /AWS_S3_BUCKET is required/);
+});
+
+await test('getValidatedS3Config rejects missing AWS_REGION', () => {
+  assert.throws(() => {
+    getValidatedS3Config({
+      CF_PAGES_BRANCH: 'main',
+      AWS_S3_BUCKET: 'inkframepress-private-ebooks-442189079113-ap-south-1-an'
+    });
+  }, /AWS_REGION is required/);
+});
+
+await test('getValidatedS3Config succeeds for correct production configuration', () => {
+  const cfg = getValidatedS3Config({
+    CF_PAGES_BRANCH: 'main',
+    AWS_S3_BUCKET: 'inkframepress-private-ebooks-442189079113-ap-south-1-an',
+    AWS_REGION: 'ap-south-1'
+  });
+  assert.equal(cfg.bucket, 'inkframepress-private-ebooks-442189079113-ap-south-1-an');
+  assert.equal(cfg.region, 'ap-south-1');
+  assert.equal(cfg.key, 'Kids_Drawing_Book_Animals_School_Edition.pdf');
+});
+
+await test('getValidatedS3Config succeeds for correct staging configuration', () => {
+  const cfg = getValidatedS3Config({
+    CF_PAGES_BRANCH: 'staging',
+    AWS_S3_BUCKET: 'kids-drawing-book-staging-441378339677',
+    AWS_REGION: 'ap-southeast-2'
+  });
+  assert.equal(cfg.bucket, 'kids-drawing-book-staging-441378339677');
+  assert.equal(cfg.region, 'ap-southeast-2');
+  assert.equal(cfg.key, 'Kids_Drawing_Book_Animals_School_Edition.pdf');
+});
+
+await test('getValidatedS3Config rejects production pointing to staging bucket', () => {
+  assert.throws(() => {
+    getValidatedS3Config({
+      CF_PAGES_BRANCH: 'main',
+      AWS_S3_BUCKET: 'kids-drawing-book-staging-441378339677',
+      AWS_REGION: 'ap-south-1'
+    });
+  }, /Production environment must strictly use production S3 bucket/);
+});
+
+await test('getValidatedS3Config rejects staging pointing to production bucket', () => {
+  assert.throws(() => {
+    getValidatedS3Config({
+      CF_PAGES_BRANCH: 'staging',
+      AWS_S3_BUCKET: 'inkframepress-private-ebooks-442189079113-ap-south-1-an',
+      AWS_REGION: 'ap-southeast-2'
+    });
+  }, /Staging\/Preview environment must strictly use staging S3 bucket/);
+});
+
+await test('getValidatedS3Config rejects mismatched bucket and region', () => {
+  assert.throws(() => {
+    getValidatedS3Config({
+      CF_PAGES_BRANCH: 'staging',
+      AWS_S3_BUCKET: 'kids-drawing-book-staging-441378339677',
+      AWS_REGION: 'ap-south-1' // Wrong region for staging bucket
+    });
+  }, /Staging\/Preview environment must strictly use staging S3 bucket.*in ap-southeast-2/);
+});
+
+await test('getValidatedS3Config rejects unknown or missing environment identification', () => {
+  // Missing environment indicators
+  assert.throws(() => {
+    getValidatedS3Config({
+      AWS_S3_BUCKET: 'inkframepress-private-ebooks-442189079113-ap-south-1-an',
+      AWS_REGION: 'ap-south-1'
+    });
+  }, /Unable to determine runtime environment/);
+
+  // Unknown environment indicator
+  assert.throws(() => {
+    getValidatedS3Config({
+      ENVIRONMENT: 'unknown_env',
+      AWS_S3_BUCKET: 'inkframepress-private-ebooks-442189079113-ap-south-1-an',
+      AWS_REGION: 'ap-south-1'
+    });
+  }, /Unable to determine runtime environment/);
+});
+
+await test('Download API fails safely without making an S3 request on invalid configuration', async () => {
+  const badEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'main',
+    AWS_S3_BUCKET: 'kids-drawing-book-staging-441378339677' // Cross-environment violation
+  };
+  const req = { url: `http://localhost/api/download?order_id=${createdOrder.order_id}&token=${validToken}` };
+  const res = await handleDownload({ request: req, env: badEnv });
+  assert.equal(res.status, 500);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.error, 'Storage configuration error');
+});
+
+await test('Email PDF retrieval rejects invalid configuration before making an S3 request', async () => {
+  const badEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'main',
+    AWS_S3_BUCKET: 'kids-drawing-book-staging-441378339677' // Cross-environment violation
+  };
+  await assert.rejects(async () => {
+    await fetchPdfFromS3(badEnv);
+  }, /Production environment must strictly use production S3 bucket/);
+});
+
+await test('Email PDF retrieval fails closed if AWS credentials are unset', async () => {
+  const badCredsEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'main',
+    AWS_ACCESS_KEY_ID: '',
+    AWS_SECRET_ACCESS_KEY: ''
+  };
+  await assert.rejects(async () => {
+    await fetchPdfFromS3(badCredsEnv);
+  }, /AWS credentials missing for PDF attachment retrieval/);
 });
 
 // 6. ANALYTICS DEDUPLICATION AUDIT

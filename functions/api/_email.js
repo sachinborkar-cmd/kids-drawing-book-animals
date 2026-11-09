@@ -1,4 +1,4 @@
-import { getS3PresignedUrl } from './_aws_s3.js';
+import { getS3PresignedUrl, getValidatedS3Config, AUTHORIZED_S3_CONFIGS } from './_aws_s3.js';
 
 /**
  * Escapes HTML characters to prevent XSS / HTML injection in customer email
@@ -136,9 +136,7 @@ export function renderPurchaseEmail({ customerName, orderId, amount, currency, s
  * Downloads the private PDF from AWS S3 using SigV4 presigned URL
  */
 export async function fetchPdfFromS3(env) {
-  const bucket = (env.AWS_S3_BUCKET || env.Bucket || 'kids-drawing-book-staging-441378339677').trim();
-  const region = (env.AWS_REGION || env.Region || 'ap-southeast-2').trim();
-  const pdfKey = (env.S3_PDF_KEY || env.File || 'Kids_Drawing_Book_Animals_School_Edition.pdf').trim();
+  const { bucket, region, key: pdfKey } = getValidatedS3Config(env);
   const rawAccessKeyId = env.AWS_ACCESS_KEY_ID;
   const rawSecretAccessKey = env.AWS_SECRET_ACCESS_KEY;
 
@@ -380,7 +378,7 @@ export async function sendSmtpEmail({
  */
 export const ALLOWED_EMAIL_TYPES = Object.freeze(['purchase_delivery', 'staging_compressed_test']);
 
-export const EXPECTED_STAGING_BUCKET = 'kids-drawing-book-staging-441378339677';
+export const EXPECTED_STAGING_BUCKET = AUTHORIZED_S3_CONFIGS.staging.bucket;
 export const EXPECTED_STAGING_RAZORPAY_KEY = 'rzp_test_TuaqfpTw4hAqFw';
 
 /**

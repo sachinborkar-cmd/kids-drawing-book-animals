@@ -1,4 +1,4 @@
-import { getS3PresignedUrl } from './_aws_s3.js';
+import { getS3PresignedUrl, getValidatedS3Config } from './_aws_s3.js';
 
 /**
  * GET /api/download
@@ -65,10 +65,19 @@ export async function onRequestGet({ request, env }) {
       });
     }
 
-    // AWS S3 Configuration (supports canonical vars and Cloudflare dashboard aliases)
-    const bucket = (env.AWS_S3_BUCKET || env.Bucket || 'kids-drawing-book-staging-441378339677').trim();
-    const region = (env.AWS_REGION || env.Region || 'ap-southeast-2').trim();
-    const pdfKey = (env.S3_PDF_KEY || env.File || 'Kids_Drawing_Book_Animals_School_Edition.pdf').trim();
+    // AWS S3 Configuration - fail-closed validation
+    let s3Config;
+    try {
+      s3Config = getValidatedS3Config(env);
+    } catch (cfgErr) {
+      console.error('[Download Error]: Storage configuration invalid:', cfgErr.message);
+      return new Response(JSON.stringify({ error: 'Storage configuration error' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    const { bucket, region, key: pdfKey } = s3Config;
     const rawAccessKeyId = env.AWS_ACCESS_KEY_ID;
     const rawSecretAccessKey = env.AWS_SECRET_ACCESS_KEY;
 

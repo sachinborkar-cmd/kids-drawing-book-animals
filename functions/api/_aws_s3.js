@@ -29,6 +29,82 @@ async function hmacHex(key, data) {
   return Array.from(raw).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+export const AUTHORIZED_S3_CONFIGS = Object.freeze({
+  production: Object.freeze({
+    bucket: 'inkframepress-private-ebooks-442189079113-ap-south-1-an',
+    region: 'ap-south-1'
+  }),
+  staging: Object.freeze({
+    bucket: 'kids-drawing-book-staging-441378339677',
+    region: 'ap-southeast-2'
+  })
+});
+
+/**
+ * Validates S3 bucket and region configuration with strict fail-closed isolation.
+ * Prohibits silent defaults and ensures environment-to-infrastructure matching.
+ */
+export function getValidatedS3Config(env) {
+  if (!env || typeof env !== 'object') {
+    throw new Error('Storage configuration error: environment bindings missing');
+  }
+
+  const rawBucket = env.AWS_S3_BUCKET || env.Bucket;
+  const rawRegion = env.AWS_REGION || env.Region;
+  const rawKey = env.S3_PDF_KEY || env.File;
+
+  const bucket = typeof rawBucket === 'string' ? rawBucket.trim() : '';
+  const region = typeof rawRegion === 'string' ? rawRegion.trim() : '';
+  const key = typeof rawKey === 'string' && rawKey.trim()
+    ? rawKey.trim()
+    : 'Kids_Drawing_Book_Animals_School_Edition.pdf';
+
+  // 1. Mandatory presence check (Zero fallback)
+  if (!bucket) {
+    throw new Error('Storage bucket not configured: AWS_S3_BUCKET is required');
+  }
+  if (!region) {
+    throw new Error('Storage region not configured: AWS_REGION is required');
+  }
+
+  // 2. Identify environment context from runtime indicators
+  const envName = (typeof env.ENVIRONMENT === 'string' ? env.ENVIRONMENT : '').trim().toLowerCase();
+  const nodeEnv = (typeof env.NODE_ENV === 'string' ? env.NODE_ENV : '').trim().toLowerCase();
+  const pagesBranch = (typeof env.CF_PAGES_BRANCH === 'string' ? env.CF_PAGES_BRANCH : '').trim().toLowerCase();
+  const testTargetEnv = (typeof env.TEST_TARGET_ENV === 'string' ? env.TEST_TARGET_ENV : '').trim().toLowerCase();
+
+  const isProdSignal = pagesBranch === 'main' || pagesBranch === 'master' || envName === 'production' || nodeEnv === 'production' || testTargetEnv === 'production';
+  const isStagingSignal = pagesBranch === 'staging' || envName === 'staging' || envName === 'preview' || nodeEnv === 'staging' || testTargetEnv === 'staging';
+
+  // Check for conflicting environment signals
+  if (isProdSignal && isStagingSignal) {
+    throw new Error('Storage configuration error: Conflicting environment signals detected. Fail-closed.');
+  }
+
+  // Fail-closed on missing or unknown environment identification
+  if (!isProdSignal && !isStagingSignal) {
+    throw new Error('Storage configuration error: Unable to determine runtime environment. Fail-closed.');
+  }
+
+  // 3. Strict environment consistency checks
+  if (isProdSignal) {
+    if (bucket !== AUTHORIZED_S3_CONFIGS.production.bucket || region !== AUTHORIZED_S3_CONFIGS.production.region) {
+      throw new Error(
+        `Storage configuration error: Production environment must strictly use production S3 bucket (${AUTHORIZED_S3_CONFIGS.production.bucket}) in ${AUTHORIZED_S3_CONFIGS.production.region}. Cross-environment configuration is prohibited.`
+      );
+    }
+  } else {
+    // Staging / Preview
+    if (bucket !== AUTHORIZED_S3_CONFIGS.staging.bucket || region !== AUTHORIZED_S3_CONFIGS.staging.region) {
+      throw new Error(
+        `Storage configuration error: Staging/Preview environment must strictly use staging S3 bucket (${AUTHORIZED_S3_CONFIGS.staging.bucket}) in ${AUTHORIZED_S3_CONFIGS.staging.region}. Cross-environment configuration is prohibited.`
+      );
+    }
+  }
+
+  return { bucket, region, key };
+}
+
 /**
  * Generate AWS S3 GET Presigned URL
  */
