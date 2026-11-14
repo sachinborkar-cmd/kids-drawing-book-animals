@@ -197,13 +197,14 @@ const mockDb = new MockD1();
 const mockEnv = {
   DB: mockDb,
   CF_PAGES_BRANCH: 'main',
+  ENVIRONMENT: 'production',
   PRODUCT_PRICE: '149',
   PRODUCT_CURRENCY: 'INR',
   RAZORPAY_KEY_ID: 'rzp_test_placeholder',
   RAZORPAY_KEY_SECRET: 'test_secret_key_123',
   RAZORPAY_WEBHOOK_SECRET: 'webhook_secret_xyz',
-  AWS_REGION: 'ap-south-1',
-  AWS_S3_BUCKET: 'inkframepress-private-ebooks-442189079113-ap-south-1-an',
+  AWS_REGION: 'ap-southeast-2',
+  AWS_S3_BUCKET: 'kids-drawing-book-production-441378339677',
   AWS_ACCESS_KEY_ID: 'MOCK_AWS_ACCESS_KEY_ID_123',
   AWS_SECRET_ACCESS_KEY: 'mock_aws_secret_access_key_xyz_456',
   S3_PDF_KEY: 'Kids_Drawing_Book_Animals_School_Edition.pdf',
@@ -596,7 +597,7 @@ await test('getValidatedS3Config rejects missing AWS_S3_BUCKET', () => {
   assert.throws(() => {
     getValidatedS3Config({
       CF_PAGES_BRANCH: 'main',
-      AWS_REGION: 'ap-south-1'
+      AWS_REGION: 'ap-southeast-2'
     });
   }, /AWS_S3_BUCKET is required/);
 });
@@ -605,7 +606,7 @@ await test('getValidatedS3Config rejects missing AWS_REGION', () => {
   assert.throws(() => {
     getValidatedS3Config({
       CF_PAGES_BRANCH: 'main',
-      AWS_S3_BUCKET: 'inkframepress-private-ebooks-442189079113-ap-south-1-an'
+      AWS_S3_BUCKET: 'kids-drawing-book-production-441378339677'
     });
   }, /AWS_REGION is required/);
 });
@@ -613,11 +614,11 @@ await test('getValidatedS3Config rejects missing AWS_REGION', () => {
 await test('getValidatedS3Config succeeds for correct production configuration', () => {
   const cfg = getValidatedS3Config({
     CF_PAGES_BRANCH: 'main',
-    AWS_S3_BUCKET: 'inkframepress-private-ebooks-442189079113-ap-south-1-an',
-    AWS_REGION: 'ap-south-1'
+    AWS_S3_BUCKET: 'kids-drawing-book-production-441378339677',
+    AWS_REGION: 'ap-southeast-2'
   });
-  assert.equal(cfg.bucket, 'inkframepress-private-ebooks-442189079113-ap-south-1-an');
-  assert.equal(cfg.region, 'ap-south-1');
+  assert.equal(cfg.bucket, 'kids-drawing-book-production-441378339677');
+  assert.equal(cfg.region, 'ap-southeast-2');
   assert.equal(cfg.key, 'Kids_Drawing_Book_Animals_School_Edition.pdf');
 });
 
@@ -637,7 +638,7 @@ await test('getValidatedS3Config rejects production pointing to staging bucket',
     getValidatedS3Config({
       CF_PAGES_BRANCH: 'main',
       AWS_S3_BUCKET: 'kids-drawing-book-staging-441378339677',
-      AWS_REGION: 'ap-south-1'
+      AWS_REGION: 'ap-southeast-2'
     });
   }, /Production environment must strictly use production S3 bucket/);
 });
@@ -646,7 +647,7 @@ await test('getValidatedS3Config rejects staging pointing to production bucket',
   assert.throws(() => {
     getValidatedS3Config({
       CF_PAGES_BRANCH: 'staging',
-      AWS_S3_BUCKET: 'inkframepress-private-ebooks-442189079113-ap-south-1-an',
+      AWS_S3_BUCKET: 'kids-drawing-book-production-441378339677',
       AWS_REGION: 'ap-southeast-2'
     });
   }, /Staging\/Preview environment must strictly use staging S3 bucket/);
@@ -660,14 +661,22 @@ await test('getValidatedS3Config rejects mismatched bucket and region', () => {
       AWS_REGION: 'ap-south-1' // Wrong region for staging bucket
     });
   }, /Staging\/Preview environment must strictly use staging S3 bucket.*in ap-southeast-2/);
+
+  assert.throws(() => {
+    getValidatedS3Config({
+      CF_PAGES_BRANCH: 'main',
+      AWS_S3_BUCKET: 'kids-drawing-book-production-441378339677',
+      AWS_REGION: 'ap-south-1' // Wrong region for production bucket
+    });
+  }, /Production environment must strictly use production S3 bucket.*in ap-southeast-2/);
 });
 
 await test('getValidatedS3Config rejects unknown or missing environment identification', () => {
   // Missing environment indicators
   assert.throws(() => {
     getValidatedS3Config({
-      AWS_S3_BUCKET: 'inkframepress-private-ebooks-442189079113-ap-south-1-an',
-      AWS_REGION: 'ap-south-1'
+      AWS_S3_BUCKET: 'kids-drawing-book-production-441378339677',
+      AWS_REGION: 'ap-southeast-2'
     });
   }, /Unable to determine runtime environment/);
 
@@ -675,8 +684,8 @@ await test('getValidatedS3Config rejects unknown or missing environment identifi
   assert.throws(() => {
     getValidatedS3Config({
       ENVIRONMENT: 'unknown_env',
-      AWS_S3_BUCKET: 'inkframepress-private-ebooks-442189079113-ap-south-1-an',
-      AWS_REGION: 'ap-south-1'
+      AWS_S3_BUCKET: 'kids-drawing-book-production-441378339677',
+      AWS_REGION: 'ap-southeast-2'
     });
   }, /Unable to determine runtime environment/);
 });
@@ -1082,6 +1091,7 @@ const dynamicTestPreviewSecret = 'preview_sec_' + Math.random().toString(36).sub
 
 const previewTestEnv = {
   ...mockEnv,
+  ENVIRONMENT: 'staging',
   CF_PAGES_BRANCH: 'staging',
   AWS_S3_BUCKET: EXPECTED_STAGING_BUCKET,
   AWS_REGION: 'ap-southeast-2',
@@ -1126,10 +1136,10 @@ await test('isPositivelyVerifiedPreview strictly enforces multi-factor preview v
     CF_PAGES_BRANCH: 'master'
   }), false, 'Production branch master must return false');
 
-  // Fail-closed 6: Correct staging branch but wrong bucket
+  // Fail-closed 6: Correct staging branch but wrong bucket (e.g. production bucket)
   assert.equal(isPositivelyVerifiedPreview({
     ...previewTestEnv,
-    AWS_S3_BUCKET: 'inkframepress-private-ebooks-442189079113-ap-south-1-an'
+    AWS_S3_BUCKET: 'kids-drawing-book-production-441378339677'
   }), false, 'Correct branch with wrong bucket must return false');
 
   // Fail-closed 7: Correct staging branch but wrong Razorpay key

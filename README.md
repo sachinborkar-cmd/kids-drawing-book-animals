@@ -9,7 +9,7 @@ A professional, mobile-first, high-converting digital product selling funnel bui
 - **Frontend:** Cloudflare Pages (Fast global CDN, mobile-responsive, zero paid plugins).
 - **Backend APIs:** Cloudflare Pages Functions / Cloudflare Workers (`functions/api/`).
 - **Database:** Cloudflare D1 (`schema.sql`) for order records, signature verification, and webhook idempotency.
-- **Private File Storage:** AWS S3 (`inkframepress-private-ebooks-442189079113-ap-south-1-an`) using secure, short-lived (30 min) AWS SigV4 presigned URLs.
+- **Private File Storage:** AWS S3 (`kids-drawing-book-production-441378339677`) in `ap-southeast-2` using secure, short-lived AWS SigV4 presigned URLs.
 - **Payment Processing:** Razorpay Standard Checkout (Cards, UPI, NetBanking, Wallets).
 - **Analytics:** Integrated tracking for Meta Pixel, GA4, and Google Tag Manager (`PageView`, `ViewContent`, `InitiateCheckout`, `Purchase`).
 
@@ -148,8 +148,8 @@ In Cloudflare Dashboard > Workers & Pages > Settings > Environment Variables:
 - `RAZORPAY_WEBHOOK_SECRET`: Your Razorpay Webhook secret (Encrypted secret)
 - `AWS_ACCESS_KEY_ID`: Your AWS Access Key ID (e.g. `AKIA...`)
 - `AWS_SECRET_ACCESS_KEY`: Your AWS Secret Access Key (Encrypted secret)
-- `AWS_REGION`: `ap-south-1`
-- `AWS_S3_BUCKET`: `inkframepress-private-ebooks-442189079113-ap-south-1-an`
+- `AWS_REGION`: `ap-southeast-2`
+- `AWS_S3_BUCKET`: `kids-drawing-book-production-441378339677`
 - `S3_PDF_KEY`: `Kids_Drawing_Book_Animals_School_Edition.pdf`
 - `PRODUCT_PRICE`: `149` (or your chosen price)
 

@@ -31,8 +31,8 @@ async function hmacHex(key, data) {
 
 export const AUTHORIZED_S3_CONFIGS = Object.freeze({
   production: Object.freeze({
-    bucket: 'inkframepress-private-ebooks-442189079113-ap-south-1-an',
-    region: 'ap-south-1'
+    bucket: 'kids-drawing-book-production-441378339677',
+    region: 'ap-southeast-2'
   }),
   staging: Object.freeze({
     bucket: 'kids-drawing-book-staging-441378339677',
