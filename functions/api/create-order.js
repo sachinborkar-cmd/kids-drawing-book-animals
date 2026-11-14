@@ -14,6 +14,24 @@ export async function onRequestPost({ request, env }) {
       });
     }
 
+    // Validate phone number: Optional, but if provided, must be exactly 10 numeric digits
+    let validatedPhone = '';
+    if (phone !== undefined && phone !== null) {
+      const rawPhone = String(phone).trim();
+      if (rawPhone.length > 0) {
+        if (!/^\d{10}$/.test(rawPhone)) {
+          return new Response(JSON.stringify({
+            success: false,
+            error: 'Invalid phone number. Please enter a valid 10-digit mobile number, or leave it blank.'
+          }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+        validatedPhone = rawPhone;
+      }
+    }
+
     const price = parseInt(env.PRODUCT_PRICE || '149', 10);
     const currency = env.PRODUCT_CURRENCY || 'INR';
     const amountInPaise = price * 100;
@@ -39,7 +57,7 @@ export async function onRequestPost({ request, env }) {
           notes: {
             customer_name: name || '',
             customer_email: email,
-            customer_phone: phone || '',
+            customer_phone: validatedPhone,
             product: 'kids-drawing-book-animals'
           }
         })
@@ -69,7 +87,7 @@ export async function onRequestPost({ request, env }) {
         await env.DB.prepare(`
           INSERT INTO orders (id, razorpay_order_id, customer_name, customer_email, customer_phone, amount, currency, status)
           VALUES (?, ?, ?, ?, ?, ?, ?, 'created')
-        `).bind(localOrderId, razorpayOrderId, name || '', email, phone || '', price, currency).run();
+        `).bind(localOrderId, razorpayOrderId, name || '', email, validatedPhone, price, currency).run();
       } catch (dbErr) {
         console.warn('[D1 Order Insert Warning]:', dbErr.message);
       }
@@ -85,7 +103,7 @@ export async function onRequestPost({ request, env }) {
       customer: {
         name: name || '',
         email: email,
-        phone: phone || ''
+        phone: validatedPhone
       }
     }), {
       headers: { 'Content-Type': 'application/json' }

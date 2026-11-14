@@ -299,6 +299,70 @@ await test('POST /api/create-order blocks requests without valid email', async (
   assert.equal(res.status, 400);
 });
 
+await test('POST /api/create-order phone validation (optional & exact 10 digits)', async () => {
+  // 1. Empty phone number -> Accepted (200)
+  const resEmpty = await handleCreateOrder({
+    request: { json: async () => ({ name: 'Test Parent', email: 'test@example.com', phone: '' }) },
+    env: mockEnv
+  });
+  assert.equal(resEmpty.status, 200, 'Empty phone must be accepted');
+  const emptyData = JSON.parse(await resEmpty.text());
+  assert.equal(emptyData.customer.phone, '', 'Empty phone must be stored as empty string');
+
+  // 2. Missing phone field -> Accepted (200)
+  const resMissing = await handleCreateOrder({
+    request: { json: async () => ({ name: 'Test Parent', email: 'test@example.com' }) },
+    env: mockEnv
+  });
+  assert.equal(resMissing.status, 200, 'Missing phone field must be accepted');
+  const missingData = JSON.parse(await resMissing.text());
+  assert.equal(missingData.customer.phone, '', 'Missing phone must default to empty string');
+
+  // 3. Valid 10-digit number (9876543210) -> Accepted (200)
+  const resValid = await handleCreateOrder({
+    request: { json: async () => ({ name: 'Test Parent', email: 'test@example.com', phone: '9876543210' }) },
+    env: mockEnv
+  });
+  assert.equal(resValid.status, 200, 'Valid 10-digit number must be accepted');
+  const validData = JSON.parse(await resValid.text());
+  assert.equal(validData.customer.phone, '9876543210');
+
+  // 4. 9-digit number (987654321) -> Rejected (400)
+  const res9 = await handleCreateOrder({
+    request: { json: async () => ({ name: 'Test Parent', email: 'test@example.com', phone: '987654321' }) },
+    env: mockEnv
+  });
+  assert.equal(res9.status, 400, '9-digit phone must be rejected with 400');
+
+  // 5. 11-digit number (98765432100) -> Rejected (400)
+  const res11 = await handleCreateOrder({
+    request: { json: async () => ({ name: 'Test Parent', email: 'test@example.com', phone: '98765432100' }) },
+    env: mockEnv
+  });
+  assert.equal(res11.status, 400, '11-digit phone must be rejected with 400');
+
+  // 6. Alphabetic characters (abcdefghij) -> Rejected (400)
+  const resAlpha = await handleCreateOrder({
+    request: { json: async () => ({ name: 'Test Parent', email: 'test@example.com', phone: 'abcdefghij' }) },
+    env: mockEnv
+  });
+  assert.equal(resAlpha.status, 400, 'Alphabetic phone must be rejected with 400');
+
+  // 7. Special characters (!@#$%^&*()) -> Rejected (400)
+  const resSpecial = await handleCreateOrder({
+    request: { json: async () => ({ name: 'Test Parent', email: 'test@example.com', phone: '!@#$%^&*()' }) },
+    env: mockEnv
+  });
+  assert.equal(resSpecial.status, 400, 'Special characters in phone must be rejected with 400');
+
+  // 8. Internal spaces (98765 43210) -> Rejected (400)
+  const resSpace = await handleCreateOrder({
+    request: { json: async () => ({ name: 'Test Parent', email: 'test@example.com', phone: '98765 43210' }) },
+    env: mockEnv
+  });
+  assert.equal(resSpace.status, 400, 'Phone with spaces must be rejected with 400');
+});
+
 // 3. RAZORPAY SECURITY & SIGNATURE AUDIT
 console.log('\n[Audit Test 3: Razorpay Security & Signature Tests]');
 let validToken = null;

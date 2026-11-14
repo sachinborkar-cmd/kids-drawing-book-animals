@@ -76,11 +76,20 @@
       e.preventDefault();
       const name = document.getElementById('cust-name')?.value.trim();
       const email = document.getElementById('cust-email')?.value.trim();
-      const phone = document.getElementById('cust-phone')?.value.trim();
+      const phoneInput = document.getElementById('cust-phone')?.value.trim();
 
       if (!email || !email.includes('@')) {
         this.showError('Please enter a valid email address.');
         return;
+      }
+
+      let phone = '';
+      if (phoneInput && phoneInput.length > 0) {
+        if (!/^\d{10}$/.test(phoneInput)) {
+          this.showError('Please enter a valid 10-digit mobile number, or leave it blank.');
+          return;
+        }
+        phone = phoneInput;
       }
 
       this.setLoading(true);
