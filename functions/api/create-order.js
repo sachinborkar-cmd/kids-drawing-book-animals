@@ -35,15 +35,52 @@ export async function onRequestPost({ request, env }) {
     const price = parseInt(env.PRODUCT_PRICE || '149', 10);
     const currency = env.PRODUCT_CURRENCY || 'INR';
     const amountInPaise = price * 100;
-    const keyId = env.RAZORPAY_KEY_ID || 'rzp_test_placeholder';
-    const keySecret = env.RAZORPAY_KEY_SECRET;
+    const rawKeyId = typeof env.RAZORPAY_KEY_ID === 'string' ? env.RAZORPAY_KEY_ID.trim() : '';
+    const rawKeySecret = typeof env.RAZORPAY_KEY_SECRET === 'string' ? env.RAZORPAY_KEY_SECRET.trim() : '';
+
+    // Environment detection
+    const envName = (typeof env.ENVIRONMENT === 'string' ? env.ENVIRONMENT : '').trim().toLowerCase();
+    const nodeEnv = (typeof env.NODE_ENV === 'string' ? env.NODE_ENV : '').trim().toLowerCase();
+    const pagesBranch = (typeof env.CF_PAGES_BRANCH === 'string' ? env.CF_PAGES_BRANCH : '').trim().toLowerCase();
+    const testTargetEnv = (typeof env.TEST_TARGET_ENV === 'string' ? env.TEST_TARGET_ENV : '').trim().toLowerCase();
+
+    const isProd = pagesBranch === 'main' || pagesBranch === 'master' || envName === 'production' || nodeEnv === 'production' || testTargetEnv === 'production';
+    const isPreview = pagesBranch === 'staging' || envName === 'staging' || envName === 'preview' || nodeEnv === 'staging' || testTargetEnv === 'staging';
+
+    const isPlaceholder = !rawKeyId || rawKeyId.includes('placeholder');
+
+    // 1. Production fail-closed validation: reject if key is missing/placeholder or secret is missing
+    if (isProd) {
+      if (isPlaceholder || !rawKeySecret) {
+        return new Response(JSON.stringify({
+          success: false,
+          error: 'Payment gateway credentials not configured in production.'
+        }), {
+          status: 503,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+    }
+
+    // 2. Preview / Staging fail-closed validation: reject if key is missing/placeholder or secret is missing
+    if (isPreview) {
+      if (isPlaceholder || !rawKeySecret) {
+        return new Response(JSON.stringify({
+          success: false,
+          error: 'Payment gateway credentials not configured in preview/staging environment.'
+        }), {
+          status: 503,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+    }
 
     const receipt = `rcpt_${Date.now().toString().slice(-8)}`;
     let razorpayOrderId = null;
 
-    // Call Razorpay API if live/test secret is provided
-    if (keySecret && keyId && !keyId.includes('placeholder')) {
-      const basicAuth = btoa(`${keyId}:${keySecret}`);
+    // Call Razorpay API when valid genuine credentials are present
+    if (rawKeySecret && rawKeyId && !isPlaceholder) {
+      const basicAuth = btoa(`${rawKeyId}:${rawKeySecret}`);
       const rzpRes = await fetch('https://api.razorpay.com/v1/orders', {
         method: 'POST',
         headers: {
@@ -67,7 +104,7 @@ export async function onRequestPost({ request, env }) {
         const errText = await rzpRes.text();
         console.error('[Razorpay Order Error]:', errText);
         return new Response(JSON.stringify({ success: false, error: 'Payment gateway initialization failed.' }), {
-          status: 502,
+          status: 503,
           headers: { 'Content-Type': 'application/json' }
         });
       }
@@ -75,8 +112,19 @@ export async function onRequestPost({ request, env }) {
       const rzpData = await rzpRes.json();
       razorpayOrderId = rzpData.id;
     } else {
-      // Development / Test placeholder mode order ID
-      razorpayOrderId = `order_test_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 7)}`;
+      // Local development mock mode is strictly isolated to explicit local development configurations
+      const allowLocalMock = env.ALLOW_LOCAL_MOCK === true || env.ALLOW_LOCAL_MOCK === 'true' || nodeEnv === 'development';
+      if (!isProd && !isPreview && allowLocalMock) {
+        razorpayOrderId = `order_test_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 7)}`;
+      } else {
+        return new Response(JSON.stringify({
+          success: false,
+          error: 'Payment gateway is unavailable.'
+        }), {
+          status: 503,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
     }
 
     const localOrderId = `ord_${Date.now()}`;
@@ -99,7 +147,7 @@ export async function onRequestPost({ request, env }) {
       razorpay_order_id: razorpayOrderId,
       amount: amountInPaise,
       currency: currency,
-      key_id: keyId,
+      key_id: rawKeyId,
       customer: {
         name: name || '',
         email: email,

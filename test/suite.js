@@ -95,8 +95,30 @@ class MockD1 {
           }
           if (q.startsWith('UPDATE orders') && q.includes("status = 'failed'")) {
             const [rzp_order_id] = args;
-            const rec = this.orders.get(rzp_order_id);
-            if (rec) rec.status = 'failed';
+            const rec = this.orders.get(rzp_order_id) || Array.from(this.orders.values()).find(o => o.razorpay_order_id === rzp_order_id);
+            if (rec && (!q.includes("status != 'paid'") || rec.status !== 'paid')) {
+              rec.status = 'failed';
+            }
+            return { success: true };
+          }
+          if (q.startsWith('UPDATE orders') && (q.includes('SET status = ?') || q.includes("status = 'refunded'"))) {
+            const [targetStatus, orderId, checkOrderId, paymentId, checkPaymentId] = args;
+            const rec = Array.from(this.orders.values()).find(o =>
+              (checkOrderId && o.razorpay_order_id === orderId) ||
+              (checkPaymentId && o.razorpay_payment_id === paymentId)
+            );
+            if (rec && rec.status !== 'refunded') {
+              rec.status = targetStatus;
+            }
+            return { success: true };
+          }
+          if (q.startsWith('UPDATE orders') && q.includes("status = 'disputed'")) {
+            const [orderId, checkOrderId, paymentId, checkPaymentId] = args;
+            const rec = Array.from(this.orders.values()).find(o =>
+              (checkOrderId && o.razorpay_order_id === orderId) ||
+              (checkPaymentId && o.razorpay_payment_id === paymentId)
+            );
+            if (rec) rec.status = 'disputed';
             return { success: true };
           }
           if (q.startsWith('UPDATE orders') && q.includes('download_count')) {
@@ -193,6 +215,81 @@ class MockD1 {
   }
 }
 
+// Mock global fetch for Razorpay Orders and Payments API
+const originalFetch = globalThis.fetch;
+let mockFetchCounter = 1;
+globalThis.fetch = async (url, options = {}) => {
+  const urlStr = String(url);
+  if (urlStr.includes('api.razorpay.com/v1/orders')) {
+    if (globalThis.__mockRazorpayApiError) {
+      return {
+        ok: false,
+        status: 502,
+        text: async () => 'Razorpay Gateway Failure'
+      };
+    }
+    const body = options.body ? JSON.parse(options.body) : {};
+    const orderId = `order_rzp_mock_${mockFetchCounter++}`;
+    globalThis.__lastCreatedRzpOrderId = orderId;
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        id: orderId,
+        entity: 'order',
+        amount: body.amount || 14900,
+        currency: body.currency || 'INR',
+        receipt: body.receipt || 'rcpt_mock',
+        status: 'created'
+      })
+    };
+  }
+
+  if (urlStr.includes('api.razorpay.com/v1/payments/')) {
+    if (globalThis.__mockPaymentTimeout) {
+      const err = new Error('The operation was aborted');
+      err.name = 'AbortError';
+      throw err;
+    }
+    if (globalThis.__mockPaymentApiError) {
+      return {
+        ok: false,
+        status: 500,
+        text: async () => 'Razorpay Payment API Internal Error'
+      };
+    }
+    const paymentId = globalThis.__mockPaymentId !== undefined ? globalThis.__mockPaymentId : (urlStr.split('/payments/')[1]?.split('?')[0] || 'pay_mock_123');
+    const status = globalThis.__mockPaymentStatus || 'captured';
+    const amount = globalThis.__mockPaymentAmount !== undefined ? globalThis.__mockPaymentAmount : 14900;
+    const currency = globalThis.__mockPaymentCurrency || 'INR';
+    let orderId = globalThis.__mockPaymentOrderId;
+    if (orderId === undefined) {
+      if (globalThis.__currentVerifyingOrderId) {
+        orderId = globalThis.__currentVerifyingOrderId;
+      } else if (typeof createdOrder !== 'undefined' && createdOrder && createdOrder.razorpay_order_id) {
+        orderId = createdOrder.razorpay_order_id;
+      } else {
+        orderId = globalThis.__lastCreatedRzpOrderId || 'order_rzp_mock_1';
+      }
+    }
+
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        id: paymentId,
+        entity: 'payment',
+        amount: amount,
+        currency: currency,
+        status: status,
+        order_id: orderId
+      })
+    };
+  }
+
+  return originalFetch(url, options);
+};
+
 const mockDb = new MockD1();
 const mockEnv = {
   DB: mockDb,
@@ -200,7 +297,7 @@ const mockEnv = {
   ENVIRONMENT: 'production',
   PRODUCT_PRICE: '149',
   PRODUCT_CURRENCY: 'INR',
-  RAZORPAY_KEY_ID: 'rzp_test_placeholder',
+  RAZORPAY_KEY_ID: 'rzp_live_test_genuine_key_123',
   RAZORPAY_KEY_SECRET: 'test_secret_key_123',
   RAZORPAY_WEBHOOK_SECRET: 'webhook_secret_xyz',
   AWS_REGION: 'ap-southeast-2',
@@ -1586,6 +1683,955 @@ await test('POST /api/test-email rejects unpaid orders and non-existent orders',
   const dataUnpaid = JSON.parse(await resUnpaid.text());
   assert.equal(dataUnpaid.success, false);
   assert(dataUnpaid.error.includes("Order status is 'created'"));
+});
+
+// 8. RAZORPAY PRODUCTION HARDENING & FAIL-CLOSED SAFEGUARDS
+console.log('\n[Audit Test 8: Razorpay Production Hardening & Fail-Closed Safeguards]');
+
+await test('Production rejects order creation if RAZORPAY_KEY_ID contains placeholder', async () => {
+  const prodPlaceholderEnv = {
+    ...mockEnv,
+    ENVIRONMENT: 'production',
+    CF_PAGES_BRANCH: 'main',
+    RAZORPAY_KEY_ID: 'rzp_test_placeholder'
+  };
+  const initialCount = mockDb.orders.size;
+  const res = await handleCreateOrder({
+    request: { json: async () => ({ name: 'Test User', email: 'test@example.com' }) },
+    env: prodPlaceholderEnv
+  });
+  assert.equal(res.status, 503);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.success, false);
+  assert(data.error.includes('credentials not configured in production'));
+  assert.equal(mockDb.orders.size, initialCount, 'Zero mock orders inserted into Production D1');
+});
+
+await test('Production rejects order creation if RAZORPAY_KEY_SECRET is missing', async () => {
+  const prodNoSecretEnv = {
+    ...mockEnv,
+    ENVIRONMENT: 'production',
+    CF_PAGES_BRANCH: 'main',
+    RAZORPAY_KEY_SECRET: ''
+  };
+  const initialCount = mockDb.orders.size;
+  const res = await handleCreateOrder({
+    request: { json: async () => ({ name: 'Test User', email: 'test@example.com' }) },
+    env: prodNoSecretEnv
+  });
+  assert.equal(res.status, 503);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.success, false);
+  assert(data.error.includes('credentials not configured in production'));
+  assert.equal(mockDb.orders.size, initialCount, 'Zero mock orders inserted into Production D1');
+});
+
+await test('Production strictly rejects mock order generation even if ALLOW_LOCAL_MOCK is requested', async () => {
+  const prodMockBypassAttemptEnv = {
+    ...mockEnv,
+    ENVIRONMENT: 'production',
+    CF_PAGES_BRANCH: 'main',
+    ALLOW_LOCAL_MOCK: true,
+    RAZORPAY_KEY_ID: 'rzp_test_placeholder'
+  };
+  const res = await handleCreateOrder({
+    request: { json: async () => ({ name: 'Bypass Attempt', email: 'bypass@example.com' }) },
+    env: prodMockBypassAttemptEnv
+  });
+  assert.equal(res.status, 503, 'Production must never allow mock orders');
+});
+
+await test('Preview Test Mode works with genuine test credentials', async () => {
+  const previewEnv = {
+    ...mockEnv,
+    ENVIRONMENT: 'staging',
+    CF_PAGES_BRANCH: 'staging',
+    RAZORPAY_KEY_ID: 'rzp_test_TuaqfpTw4hAqFw',
+    RAZORPAY_KEY_SECRET: 'test_secret_key_123'
+  };
+  const res = await handleCreateOrder({
+    request: { json: async () => ({ name: 'Preview Parent', email: 'preview@example.com', phone: '9876543210' }) },
+    env: previewEnv
+  });
+  assert.equal(res.status, 200);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.key_id, 'rzp_test_TuaqfpTw4hAqFw');
+  assert(data.razorpay_order_id.startsWith('order_rzp_mock_'));
+  assert.equal(data.amount, 14900);
+  assert.equal(data.currency, 'INR');
+});
+
+await test('Preview Test Mode rejects placeholder key', async () => {
+  const previewPlaceholderEnv = {
+    ...mockEnv,
+    ENVIRONMENT: 'staging',
+    CF_PAGES_BRANCH: 'staging',
+    RAZORPAY_KEY_ID: 'rzp_test_placeholder'
+  };
+  const res = await handleCreateOrder({
+    request: { json: async () => ({ name: 'Preview Parent', email: 'preview@example.com' }) },
+    env: previewPlaceholderEnv
+  });
+  assert.equal(res.status, 503);
+  const data = JSON.parse(await res.text());
+  assert(data.error.includes('credentials not configured in preview/staging'));
+});
+
+await test('Local development mock is isolated strictly to explicit local mock environment', async () => {
+  // 1. Explicit mock allowed on local development
+  const localMockAllowedEnv = {
+    ...mockEnv,
+    ENVIRONMENT: 'development',
+    CF_PAGES_BRANCH: '',
+    NODE_ENV: 'development',
+    ALLOW_LOCAL_MOCK: true,
+    RAZORPAY_KEY_ID: 'rzp_test_placeholder',
+    RAZORPAY_KEY_SECRET: ''
+  };
+  const resAllowed = await handleCreateOrder({
+    request: { json: async () => ({ name: 'Local Dev User', email: 'dev@example.com' }) },
+    env: localMockAllowedEnv
+  });
+  assert.equal(resAllowed.status, 200);
+  const dataAllowed = JSON.parse(await resAllowed.text());
+  assert(dataAllowed.razorpay_order_id.startsWith('order_test_'));
+
+  // 2. Mock refused if ALLOW_LOCAL_MOCK is not enabled
+  const localMockDisabledEnv = {
+    ...localMockAllowedEnv,
+    ALLOW_LOCAL_MOCK: false,
+    NODE_ENV: 'test'
+  };
+  const resDisabled = await handleCreateOrder({
+    request: { json: async () => ({ name: 'Local Dev User', email: 'dev@example.com' }) },
+    env: localMockDisabledEnv
+  });
+  assert.equal(resDisabled.status, 503);
+});
+
+await test('Gateway initialization failure returns HTTP 503', async () => {
+  globalThis.__mockRazorpayApiError = true;
+  try {
+    const res = await handleCreateOrder({
+      request: { json: async () => ({ name: 'API Error User', email: 'api-err@example.com' }) },
+      env: mockEnv
+    });
+    assert.equal(res.status, 503);
+    const data = JSON.parse(await res.text());
+    assert.equal(data.error, 'Payment gateway initialization failed.');
+  } finally {
+    globalThis.__mockRazorpayApiError = false;
+  }
+});
+
+await test('Payment verification rejects Order ID mismatch', async () => {
+  const targetId = 'ord_mismatch_check_1';
+  const actualRzpId = 'order_actual_rzp_999';
+  mockDb.orders.set(actualRzpId, {
+    id: targetId,
+    razorpay_order_id: actualRzpId,
+    amount: 149,
+    currency: 'INR',
+    status: 'created'
+  });
+  const tamperedRzpId = 'order_tampered_rzp_888';
+  const paymentId = 'pay_mismatch_test_1';
+  const signature = await computeWebhookSig(`${tamperedRzpId}|${paymentId}`, mockEnv.RAZORPAY_KEY_SECRET);
+
+  const res = await handleVerifyPayment({
+    request: {
+      json: async () => ({
+        order_id: targetId,
+        razorpay_order_id: tamperedRzpId,
+        razorpay_payment_id: paymentId,
+        razorpay_signature: signature
+      })
+    },
+    env: mockEnv
+  });
+  assert.equal(res.status, 400);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.verified, false);
+  assert.equal(data.error, 'Order ID mismatch.');
+});
+
+await test('Payment verification rejects amount and currency mismatch', async () => {
+  // Tampered Amount
+  const badAmtOrderId = 'order_bad_amt_1';
+  mockDb.orders.set(badAmtOrderId, {
+    id: 'ord_bad_amt',
+    razorpay_order_id: badAmtOrderId,
+    amount: 99, // mismatch (expected 149)
+    currency: 'INR',
+    status: 'created'
+  });
+  const sigAmt = await computeWebhookSig(`${badAmtOrderId}|pay_bad_amt`, mockEnv.RAZORPAY_KEY_SECRET);
+  const resAmt = await handleVerifyPayment({
+    request: {
+      json: async () => ({
+        order_id: 'ord_bad_amt',
+        razorpay_order_id: badAmtOrderId,
+        razorpay_payment_id: 'pay_bad_amt',
+        razorpay_signature: sigAmt
+      })
+    },
+    env: mockEnv
+  });
+  assert.equal(resAmt.status, 400);
+  const dataAmt = JSON.parse(await resAmt.text());
+  assert.equal(dataAmt.error, 'Payment amount mismatch.');
+
+  // Tampered Currency
+  const badCurrOrderId = 'order_bad_curr_1';
+  mockDb.orders.set(badCurrOrderId, {
+    id: 'ord_bad_curr',
+    razorpay_order_id: badCurrOrderId,
+    amount: 149,
+    currency: 'USD', // mismatch (expected INR)
+    status: 'created'
+  });
+  const sigCurr = await computeWebhookSig(`${badCurrOrderId}|pay_bad_curr`, mockEnv.RAZORPAY_KEY_SECRET);
+  const resCurr = await handleVerifyPayment({
+    request: {
+      json: async () => ({
+        order_id: 'ord_bad_curr',
+        razorpay_order_id: badCurrOrderId,
+        razorpay_payment_id: 'pay_bad_curr',
+        razorpay_signature: sigCurr
+      })
+    },
+    env: mockEnv
+  });
+  assert.equal(resCurr.status, 400);
+  const dataCurr = JSON.parse(await resCurr.text());
+  assert.equal(dataCurr.error, 'Payment currency mismatch.');
+});
+
+await test('Existing download token preservation on repeat verification (Idempotency)', async () => {
+  const initialToken = 'token_original_preserved_hex_789';
+  const repeatRzpId = 'order_repeat_verify_123';
+  mockDb.orders.set(repeatRzpId, {
+    id: 'ord_repeat_preserve',
+    razorpay_order_id: repeatRzpId,
+    customer_email: 'repeat@example.com',
+    amount: 149,
+    currency: 'INR',
+    status: 'paid',
+    download_token: initialToken
+  });
+
+  const sigRepeat = await computeWebhookSig(`${repeatRzpId}|pay_repeat_preserve`, mockEnv.RAZORPAY_KEY_SECRET);
+  const resRepeat = await handleVerifyPayment({
+    request: {
+      json: async () => ({
+        order_id: 'ord_repeat_preserve',
+        razorpay_order_id: repeatRzpId,
+        razorpay_payment_id: 'pay_repeat_preserve',
+        razorpay_signature: sigRepeat
+      })
+    },
+    env: mockEnv
+  });
+  assert.equal(resRepeat.status, 200);
+  const dataRepeat = JSON.parse(await resRepeat.text());
+  assert.equal(dataRepeat.verified, true);
+  assert.equal(dataRepeat.download_token, initialToken, 'Must preserve existing download token');
+  assert.equal(mockDb.orders.get(repeatRzpId).download_token, initialToken, 'D1 token must remain untouched');
+});
+
+await test('Webhook handles refund.processed and updates order status to refunded', async () => {
+  const refundRzpId = 'order_to_be_refunded_101';
+  const refundPayId = 'pay_to_be_refunded_101';
+  mockDb.orders.set(refundRzpId, {
+    id: 'ord_refunded_101',
+    razorpay_order_id: refundRzpId,
+    razorpay_payment_id: refundPayId,
+    amount: 149,
+    currency: 'INR',
+    status: 'paid',
+    download_token: 'tok_refund_abc'
+  });
+
+  const refundPayload = JSON.stringify({
+    entity: 'event',
+    event: 'refund.processed',
+    id: 'evt_refund_processed_101',
+    payload: {
+      refund: {
+        entity: {
+          id: 'rfnd_abc_999',
+          payment_id: refundPayId,
+          amount: 14900,
+          currency: 'INR'
+        }
+      },
+      payment: {
+        entity: {
+          id: refundPayId,
+          order_id: refundRzpId
+        }
+      }
+    }
+  });
+  const refundSig = await computeWebhookSig(refundPayload, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+  const resRefund = await handleWebhook({
+    request: {
+      text: async () => refundPayload,
+      headers: {
+        get: (h) => (h.toLowerCase() === 'x-razorpay-signature' ? refundSig : null)
+      }
+    },
+    env: mockEnv
+  });
+  assert.equal(resRefund.status, 200);
+  assert.equal(mockDb.orders.get(refundRzpId).status, 'refunded', 'Order must transition to refunded');
+});
+
+await test('Frontend checkout.js contains required resilience and security safeguards', async () => {
+  const checkoutCode = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/checkout.js'), 'utf8');
+
+  // 1. Script unavailable error string
+  assert(checkoutCode.includes('Payment gateway could not be loaded. Please refresh the page or try again.'));
+
+  // 2. Unavailable/placeholder key error string
+  assert(checkoutCode.includes('Payment gateway is currently unavailable. Please refresh the page or try again later.'));
+
+  // 3. Modal ondismiss restores loading state
+  assert(checkoutCode.includes("this.setLoading(false)"));
+  assert(checkoutCode.includes("Payment window dismissed by customer."));
+
+  // 4. Local mock mode is strictly isolated
+  assert(checkoutCode.includes("isExplicitLocalMock"));
+  assert(checkoutCode.includes("window.location.hostname === 'localhost'"));
+
+  // 5. Dynamic /api/config loading
+  assert(checkoutCode.includes("fetch('/api/config')"));
+  assert(checkoutCode.includes("this.serverConfig"));
+});
+
+// 9. PHASE 2B: DIGITAL PRODUCT PAYMENT SECURITY HARDENING
+console.log('\n[Audit Test 9: Digital Product Payment Security Hardening (Phase 2B)]');
+
+await test('Independent capture verification: Captured payment succeeds and issues token', async () => {
+  const rzpId = 'order_rzp_phase2b_captured';
+  const payId = 'pay_phase2b_captured';
+  mockDb.orders.set(rzpId, {
+    id: 'ord_p2b_captured',
+    razorpay_order_id: rzpId,
+    customer_email: 'p2b_captured@example.com',
+    amount: 149,
+    currency: 'INR',
+    status: 'created',
+    download_token: null
+  });
+  globalThis.__mockPaymentOrderId = rzpId;
+  globalThis.__mockPaymentStatus = 'captured';
+  globalThis.__mockPaymentAmount = 14900;
+  globalThis.__mockPaymentCurrency = 'INR';
+
+  const sig = await computeWebhookSig(`${rzpId}|${payId}`, mockEnv.RAZORPAY_KEY_SECRET);
+  const res = await handleVerifyPayment({
+    request: {
+      json: async () => ({
+        order_id: 'ord_p2b_captured',
+        razorpay_order_id: rzpId,
+        razorpay_payment_id: payId,
+        razorpay_signature: sig
+      })
+    },
+    env: mockEnv
+  });
+  delete globalThis.__mockPaymentOrderId;
+  delete globalThis.__mockPaymentStatus;
+  delete globalThis.__mockPaymentAmount;
+  delete globalThis.__mockPaymentCurrency;
+
+  assert.equal(res.status, 200);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.verified, true);
+  assert(data.download_token, 'Must return download token');
+  assert.equal(mockDb.orders.get(rzpId).status, 'paid', 'D1 order must be updated to paid');
+});
+
+await test('Independent capture verification: Authorized status returns HTTP 202 and does NOT fulfill or grant token', async () => {
+  const rzpId = 'order_rzp_phase2b_auth';
+  const payId = 'pay_phase2b_auth';
+  mockDb.orders.set(rzpId, {
+    id: 'ord_p2b_auth',
+    razorpay_order_id: rzpId,
+    customer_email: 'p2b_auth@example.com',
+    amount: 149,
+    currency: 'INR',
+    status: 'created',
+    download_token: null
+  });
+  globalThis.__mockPaymentOrderId = rzpId;
+  globalThis.__mockPaymentStatus = 'authorized';
+
+  const sig = await computeWebhookSig(`${rzpId}|${payId}`, mockEnv.RAZORPAY_KEY_SECRET);
+  const res = await handleVerifyPayment({
+    request: {
+      json: async () => ({
+        order_id: 'ord_p2b_auth',
+        razorpay_order_id: rzpId,
+        razorpay_payment_id: payId,
+        razorpay_signature: sig
+      })
+    },
+    env: mockEnv
+  });
+  delete globalThis.__mockPaymentOrderId;
+  delete globalThis.__mockPaymentStatus;
+
+  assert.equal(res.status, 202);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.verified, false);
+  assert.equal(data.status, 'authorized');
+  assert(!data.download_token, 'Must NOT grant download token for authorized payment');
+  assert.equal(mockDb.orders.get(rzpId).status, 'created', 'D1 order must NOT be marked paid');
+  assert.equal(mockDb.orders.get(rzpId).download_token, null, 'D1 token must remain null');
+});
+
+await test('Independent capture verification: Pending status returns HTTP 202 and does NOT fulfill', async () => {
+  const rzpId = 'order_rzp_phase2b_pending';
+  const payId = 'pay_phase2b_pending';
+  mockDb.orders.set(rzpId, {
+    id: 'ord_p2b_pending',
+    razorpay_order_id: rzpId,
+    customer_email: 'p2b_pending@example.com',
+    amount: 149,
+    currency: 'INR',
+    status: 'created',
+    download_token: null
+  });
+  globalThis.__mockPaymentOrderId = rzpId;
+  globalThis.__mockPaymentStatus = 'pending';
+
+  const sig = await computeWebhookSig(`${rzpId}|${payId}`, mockEnv.RAZORPAY_KEY_SECRET);
+  const res = await handleVerifyPayment({
+    request: {
+      json: async () => ({
+        order_id: 'ord_p2b_pending',
+        razorpay_order_id: rzpId,
+        razorpay_payment_id: payId,
+        razorpay_signature: sig
+      })
+    },
+    env: mockEnv
+  });
+  delete globalThis.__mockPaymentOrderId;
+  delete globalThis.__mockPaymentStatus;
+
+  assert.equal(res.status, 202);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.verified, false);
+  assert.equal(data.status, 'pending');
+  assert(!data.download_token, 'Must NOT grant download token for pending payment');
+  assert.equal(mockDb.orders.get(rzpId).status, 'created', 'D1 order must NOT be marked paid');
+});
+
+await test('Independent capture verification: Failed status from gateway returns HTTP 400 and refuses fulfillment', async () => {
+  const rzpId = 'order_rzp_phase2b_failed';
+  const payId = 'pay_phase2b_failed';
+  mockDb.orders.set(rzpId, {
+    id: 'ord_p2b_failed',
+    razorpay_order_id: rzpId,
+    customer_email: 'p2b_failed@example.com',
+    amount: 149,
+    currency: 'INR',
+    status: 'created',
+    download_token: null
+  });
+  globalThis.__mockPaymentOrderId = rzpId;
+  globalThis.__mockPaymentStatus = 'failed';
+
+  const sig = await computeWebhookSig(`${rzpId}|${payId}`, mockEnv.RAZORPAY_KEY_SECRET);
+  const res = await handleVerifyPayment({
+    request: {
+      json: async () => ({
+        order_id: 'ord_p2b_failed',
+        razorpay_order_id: rzpId,
+        razorpay_payment_id: payId,
+        razorpay_signature: sig
+      })
+    },
+    env: mockEnv
+  });
+  delete globalThis.__mockPaymentOrderId;
+  delete globalThis.__mockPaymentStatus;
+
+  assert.equal(res.status, 400);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.verified, false);
+  assert.equal(mockDb.orders.get(rzpId).status, 'created', 'D1 order must NOT be marked paid');
+});
+
+await test('Independent capture verification: Gateway payment ID mismatch returns HTTP 400', async () => {
+  const rzpId = 'order_rzp_phase2b_id_mismatch';
+  const payId = 'pay_phase2b_id_mismatch';
+  mockDb.orders.set(rzpId, {
+    id: 'ord_p2b_id_mismatch',
+    razorpay_order_id: rzpId,
+    customer_email: 'p2b_id_mismatch@example.com',
+    amount: 149,
+    currency: 'INR',
+    status: 'created'
+  });
+  globalThis.__mockPaymentOrderId = rzpId;
+  globalThis.__mockPaymentId = 'pay_tampered_different_id';
+
+  const sig = await computeWebhookSig(`${rzpId}|${payId}`, mockEnv.RAZORPAY_KEY_SECRET);
+  const res = await handleVerifyPayment({
+    request: {
+      json: async () => ({
+        order_id: 'ord_p2b_id_mismatch',
+        razorpay_order_id: rzpId,
+        razorpay_payment_id: payId,
+        razorpay_signature: sig
+      })
+    },
+    env: mockEnv
+  });
+  delete globalThis.__mockPaymentOrderId;
+  delete globalThis.__mockPaymentId;
+
+  assert.equal(res.status, 400);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.verified, false);
+  assert(data.error.includes('Payment ID mismatch'));
+});
+
+await test('Independent capture verification: Gateway order ID mismatch returns HTTP 400', async () => {
+  const rzpId = 'order_rzp_phase2b_ord_mismatch';
+  const payId = 'pay_phase2b_ord_mismatch';
+  mockDb.orders.set(rzpId, {
+    id: 'ord_p2b_ord_mismatch',
+    razorpay_order_id: rzpId,
+    customer_email: 'p2b_ord_mismatch@example.com',
+    amount: 149,
+    currency: 'INR',
+    status: 'created'
+  });
+  globalThis.__mockPaymentOrderId = 'order_rzp_different_mismatch';
+
+  const sig = await computeWebhookSig(`${rzpId}|${payId}`, mockEnv.RAZORPAY_KEY_SECRET);
+  const res = await handleVerifyPayment({
+    request: {
+      json: async () => ({
+        order_id: 'ord_p2b_ord_mismatch',
+        razorpay_order_id: rzpId,
+        razorpay_payment_id: payId,
+        razorpay_signature: sig
+      })
+    },
+    env: mockEnv
+  });
+  delete globalThis.__mockPaymentOrderId;
+
+  assert.equal(res.status, 400);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.verified, false);
+  assert(data.error.includes('Payment order ID mismatch'));
+});
+
+await test('Independent capture verification: Gateway amount mismatch returns HTTP 400', async () => {
+  const rzpId = 'order_rzp_phase2b_amt_mismatch';
+  const payId = 'pay_phase2b_amt_mismatch';
+  mockDb.orders.set(rzpId, {
+    id: 'ord_p2b_amt_mismatch',
+    razorpay_order_id: rzpId,
+    customer_email: 'p2b_amt_mismatch@example.com',
+    amount: 149,
+    currency: 'INR',
+    status: 'created'
+  });
+  globalThis.__mockPaymentOrderId = rzpId;
+  globalThis.__mockPaymentAmount = 9900; // 99 INR instead of 149 INR
+
+  const sig = await computeWebhookSig(`${rzpId}|${payId}`, mockEnv.RAZORPAY_KEY_SECRET);
+  const res = await handleVerifyPayment({
+    request: {
+      json: async () => ({
+        order_id: 'ord_p2b_amt_mismatch',
+        razorpay_order_id: rzpId,
+        razorpay_payment_id: payId,
+        razorpay_signature: sig
+      })
+    },
+    env: mockEnv
+  });
+  delete globalThis.__mockPaymentOrderId;
+  delete globalThis.__mockPaymentAmount;
+
+  assert.equal(res.status, 400);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.verified, false);
+  assert(data.error.includes('Payment amount mismatch'));
+});
+
+await test('Independent capture verification: Gateway currency mismatch returns HTTP 400', async () => {
+  const rzpId = 'order_rzp_phase2b_cur_mismatch';
+  const payId = 'pay_phase2b_cur_mismatch';
+  mockDb.orders.set(rzpId, {
+    id: 'ord_p2b_cur_mismatch',
+    razorpay_order_id: rzpId,
+    customer_email: 'p2b_cur_mismatch@example.com',
+    amount: 149,
+    currency: 'INR',
+    status: 'created'
+  });
+  globalThis.__mockPaymentOrderId = rzpId;
+  globalThis.__mockPaymentCurrency = 'USD'; // USD instead of INR
+
+  const sig = await computeWebhookSig(`${rzpId}|${payId}`, mockEnv.RAZORPAY_KEY_SECRET);
+  const res = await handleVerifyPayment({
+    request: {
+      json: async () => ({
+        order_id: 'ord_p2b_cur_mismatch',
+        razorpay_order_id: rzpId,
+        razorpay_payment_id: payId,
+        razorpay_signature: sig
+      })
+    },
+    env: mockEnv
+  });
+  delete globalThis.__mockPaymentOrderId;
+  delete globalThis.__mockPaymentCurrency;
+
+  assert.equal(res.status, 400);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.verified, false);
+  assert(data.error.includes('Payment currency mismatch'));
+});
+
+await test('Independent capture verification: Razorpay API timeout returns HTTP 504 and fails safely', async () => {
+  const rzpId = 'order_rzp_phase2b_timeout';
+  const payId = 'pay_phase2b_timeout';
+  mockDb.orders.set(rzpId, {
+    id: 'ord_p2b_timeout',
+    razorpay_order_id: rzpId,
+    customer_email: 'p2b_timeout@example.com',
+    amount: 149,
+    currency: 'INR',
+    status: 'created'
+  });
+  globalThis.__mockPaymentOrderId = rzpId;
+  globalThis.__mockPaymentTimeout = true;
+
+  const sig = await computeWebhookSig(`${rzpId}|${payId}`, mockEnv.RAZORPAY_KEY_SECRET);
+  const res = await handleVerifyPayment({
+    request: {
+      json: async () => ({
+        order_id: 'ord_p2b_timeout',
+        razorpay_order_id: rzpId,
+        razorpay_payment_id: payId,
+        razorpay_signature: sig
+      })
+    },
+    env: mockEnv
+  });
+  delete globalThis.__mockPaymentOrderId;
+  delete globalThis.__mockPaymentTimeout;
+
+  assert.equal(res.status, 504);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.verified, false);
+  assert.equal(data.status, 'gateway_timeout');
+  assert.equal(mockDb.orders.get(rzpId).status, 'created', 'Order must NOT be marked paid on gateway timeout');
+});
+
+await test('Independent capture verification: Razorpay API 500 error returns HTTP 502 and fails safely', async () => {
+  const rzpId = 'order_rzp_phase2b_apierr';
+  const payId = 'pay_phase2b_apierr';
+  mockDb.orders.set(rzpId, {
+    id: 'ord_p2b_apierr',
+    razorpay_order_id: rzpId,
+    customer_email: 'p2b_apierr@example.com',
+    amount: 149,
+    currency: 'INR',
+    status: 'created'
+  });
+  globalThis.__mockPaymentOrderId = rzpId;
+  globalThis.__mockPaymentApiError = true;
+
+  const sig = await computeWebhookSig(`${rzpId}|${payId}`, mockEnv.RAZORPAY_KEY_SECRET);
+  const res = await handleVerifyPayment({
+    request: {
+      json: async () => ({
+        order_id: 'ord_p2b_apierr',
+        razorpay_order_id: rzpId,
+        razorpay_payment_id: payId,
+        razorpay_signature: sig
+      })
+    },
+    env: mockEnv
+  });
+  delete globalThis.__mockPaymentOrderId;
+  delete globalThis.__mockPaymentApiError;
+
+  assert.equal(res.status, 502);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.verified, false);
+  assert.equal(data.status, 'gateway_error');
+  assert.equal(mockDb.orders.get(rzpId).status, 'created', 'Order must NOT be marked paid on gateway error');
+});
+
+await test('Simplified refund webhook: refund.created logs event but leaves order status paid', async () => {
+  const refundRzpId = 'order_rzp_refund_created';
+  const refundPayId = 'pay_refund_created';
+  mockDb.orders.set(refundRzpId, {
+    id: 'ord_refund_created_test',
+    razorpay_order_id: refundRzpId,
+    razorpay_payment_id: refundPayId,
+    amount: 149,
+    currency: 'INR',
+    status: 'paid',
+    download_token: 'tok_preserved_refund_created'
+  });
+
+  const payload = JSON.stringify({
+    entity: 'event',
+    event: 'refund.created',
+    id: 'evt_refund_created_123',
+    payload: {
+      refund: {
+        entity: {
+          id: 'rfnd_created_999',
+          payment_id: refundPayId,
+          amount: 14900,
+          currency: 'INR',
+          status: 'created'
+        }
+      },
+      payment: {
+        entity: {
+          id: refundPayId,
+          order_id: refundRzpId
+        }
+      }
+    }
+  });
+  const sig = await computeWebhookSig(payload, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+  const res = await handleWebhook({
+    request: {
+      text: async () => payload,
+      headers: { get: (h) => (h.toLowerCase() === 'x-razorpay-signature' ? sig : null) }
+    },
+    env: mockEnv
+  });
+  assert.equal(res.status, 200);
+  assert.equal(mockDb.orders.get(refundRzpId).status, 'paid', 'Order status must remain paid on refund.created');
+  assert(mockDb.webhooks.has('evt_refund_created_123'), 'Event must be logged in webhook_logs');
+});
+
+await test('Simplified refund webhook: refund.processed with partial refund (< 14900) sets status = partially_refunded', async () => {
+  const rzpId = 'order_rzp_partial_refund';
+  const payId = 'pay_partial_refund';
+  mockDb.orders.set(rzpId, {
+    id: 'ord_partial_refund_test',
+    razorpay_order_id: rzpId,
+    razorpay_payment_id: payId,
+    amount: 149,
+    currency: 'INR',
+    status: 'paid',
+    download_token: 'tok_partial_token'
+  });
+
+  const payload = JSON.stringify({
+    entity: 'event',
+    event: 'refund.processed',
+    id: 'evt_partial_refund_456',
+    payload: {
+      refund: {
+        entity: {
+          id: 'rfnd_part_888',
+          payment_id: payId,
+          amount: 5000, // 50 INR (partial refund)
+          currency: 'INR',
+          status: 'processed'
+        }
+      },
+      payment: {
+        entity: {
+          id: payId,
+          order_id: rzpId,
+          amount_refunded: 5000
+        }
+      }
+    }
+  });
+  const sig = await computeWebhookSig(payload, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+  const res = await handleWebhook({
+    request: {
+      text: async () => payload,
+      headers: { get: (h) => (h.toLowerCase() === 'x-razorpay-signature' ? sig : null) }
+    },
+    env: mockEnv
+  });
+  assert.equal(res.status, 200);
+  assert.equal(mockDb.orders.get(rzpId).status, 'partially_refunded', 'Order status must update to partially_refunded');
+  assert.equal(mockDb.orders.get(rzpId).download_token, 'tok_partial_token', 'Download token must remain intact');
+});
+
+await test('Simplified refund webhook: refund.processed for unrelated payment ID does NOT modify existing orders', async () => {
+  const rzpId = 'order_rzp_unrelated_safe';
+  mockDb.orders.set(rzpId, {
+    id: 'ord_unrelated_safe_test',
+    razorpay_order_id: rzpId,
+    razorpay_payment_id: 'pay_unrelated_safe',
+    amount: 149,
+    currency: 'INR',
+    status: 'paid',
+    download_token: 'tok_safe_untouched'
+  });
+
+  const payload = JSON.stringify({
+    entity: 'event',
+    event: 'refund.processed',
+    id: 'evt_unrelated_event_789',
+    payload: {
+      refund: {
+        entity: {
+          id: 'rfnd_unrelated_111',
+          payment_id: 'pay_completely_unrelated_foreign',
+          amount: 14900,
+          currency: 'INR',
+          status: 'processed'
+        }
+      },
+      payment: {
+        entity: {
+          id: 'pay_completely_unrelated_foreign',
+          order_id: 'order_completely_unrelated_foreign'
+        }
+      }
+    }
+  });
+  const sig = await computeWebhookSig(payload, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+  const res = await handleWebhook({
+    request: {
+      text: async () => payload,
+      headers: { get: (h) => (h.toLowerCase() === 'x-razorpay-signature' ? sig : null) }
+    },
+    env: mockEnv
+  });
+  assert.equal(res.status, 200);
+  assert.equal(mockDb.orders.get(rzpId).status, 'paid', 'Unrelated order must remain paid');
+  assert.equal(mockDb.orders.get(rzpId).download_token, 'tok_safe_untouched');
+});
+
+await test('Dispute handling: payment.dispute.created transitions order status to disputed', async () => {
+  const rzpId = 'order_rzp_dispute_created';
+  const payId = 'pay_dispute_created';
+  mockDb.orders.set(rzpId, {
+    id: 'ord_dispute_created_test',
+    razorpay_order_id: rzpId,
+    razorpay_payment_id: payId,
+    amount: 149,
+    currency: 'INR',
+    status: 'paid',
+    download_token: 'tok_dispute_preserved'
+  });
+
+  const payload = JSON.stringify({
+    entity: 'event',
+    event: 'payment.dispute.created',
+    id: 'evt_dispute_created_555',
+    payload: {
+      payment: {
+        entity: {
+          id: payId,
+          order_id: rzpId
+        }
+      }
+    }
+  });
+  const sig = await computeWebhookSig(payload, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+  const res = await handleWebhook({
+    request: {
+      text: async () => payload,
+      headers: { get: (h) => (h.toLowerCase() === 'x-razorpay-signature' ? sig : null) }
+    },
+    env: mockEnv
+  });
+  assert.equal(res.status, 200);
+  assert.equal(mockDb.orders.get(rzpId).status, 'disputed', 'Order status must transition to disputed');
+});
+
+await test('Dispute handling: payment.dispute.lost transitions order status to disputed', async () => {
+  const rzpId = 'order_rzp_dispute_lost';
+  const payId = 'pay_dispute_lost';
+  mockDb.orders.set(rzpId, {
+    id: 'ord_dispute_lost_test',
+    razorpay_order_id: rzpId,
+    razorpay_payment_id: payId,
+    amount: 149,
+    currency: 'INR',
+    status: 'paid',
+    download_token: 'tok_dispute_lost_token'
+  });
+
+  const payload = JSON.stringify({
+    entity: 'event',
+    event: 'payment.dispute.lost',
+    id: 'evt_dispute_lost_666',
+    payload: {
+      payment: {
+        entity: {
+          id: payId,
+          order_id: rzpId
+        }
+      }
+    }
+  });
+  const sig = await computeWebhookSig(payload, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+  const res = await handleWebhook({
+    request: {
+      text: async () => payload,
+      headers: { get: (h) => (h.toLowerCase() === 'x-razorpay-signature' ? sig : null) }
+    },
+    env: mockEnv
+  });
+  assert.equal(res.status, 200);
+  assert.equal(mockDb.orders.get(rzpId).status, 'disputed', 'Order status must transition to disputed');
+});
+
+await test('Payment failed webhook does NOT override already paid order status', async () => {
+  const rzpId = 'order_rzp_paid_immune';
+  const payId = 'pay_paid_immune';
+  mockDb.orders.set(rzpId, {
+    id: 'ord_paid_immune_test',
+    razorpay_order_id: rzpId,
+    razorpay_payment_id: payId,
+    amount: 149,
+    currency: 'INR',
+    status: 'paid',
+    download_token: 'tok_immune'
+  });
+
+  const payload = JSON.stringify({
+    entity: 'event',
+    event: 'payment.failed',
+    id: 'evt_failed_after_paid_777',
+    payload: {
+      payment: {
+        entity: {
+          id: payId,
+          order_id: rzpId
+        }
+      }
+    }
+  });
+  const sig = await computeWebhookSig(payload, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+  const res = await handleWebhook({
+    request: {
+      text: async () => payload,
+      headers: { get: (h) => (h.toLowerCase() === 'x-razorpay-signature' ? sig : null) }
+    },
+    env: mockEnv
+  });
+  assert.equal(res.status, 200);
+  assert.equal(mockDb.orders.get(rzpId).status, 'paid', 'Order status must remain paid despite payment.failed');
 });
 
 console.log('\n======================================================');

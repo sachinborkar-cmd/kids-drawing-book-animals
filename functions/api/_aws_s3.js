@@ -198,11 +198,20 @@ export async function getS3PresignedUrl({
 }
 
 /**
- * Verify Razorpay HMAC-SHA256 Signature
+ * Verify Razorpay HMAC-SHA256 Signature with constant-time comparison
  */
 export async function verifyRazorpaySignature(orderId, paymentId, signature, secret) {
   if (!orderId || !paymentId || !signature || !secret) return false;
   const data = `${orderId}|${paymentId}`;
   const expectedSignature = await hmacHex(secret, data);
-  return expectedSignature.toLowerCase() === signature.toLowerCase();
+
+  const sigLower = signature.toLowerCase().trim();
+  const expLower = expectedSignature.toLowerCase().trim();
+  if (sigLower.length !== expLower.length) return false;
+
+  let diff = 0;
+  for (let i = 0; i < expLower.length; i++) {
+    diff |= sigLower.charCodeAt(i) ^ expLower.charCodeAt(i);
+  }
+  return diff === 0;
 }

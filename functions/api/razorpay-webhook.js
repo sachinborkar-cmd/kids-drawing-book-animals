@@ -93,10 +93,11 @@ export async function onRequestPost(context) {
       }
     }
 
-    // Process payment events
+    // Process payment & refund events
     const paymentEntity = event.payload?.payment?.entity;
-    const orderId = paymentEntity?.order_id;
-    const paymentId = paymentEntity?.id;
+    const refundEntity = event.payload?.refund?.entity;
+    const orderId = paymentEntity?.order_id || refundEntity?.order_id;
+    const paymentId = paymentEntity?.id || refundEntity?.payment_id;
 
     if (eventType === 'payment.captured' || eventType === 'order.paid') {
       if (orderId && env.DB) {
@@ -134,8 +135,41 @@ export async function onRequestPost(context) {
           UPDATE orders
           SET status = 'failed',
               updated_at = datetime('now')
-          WHERE razorpay_order_id = ?
+          WHERE razorpay_order_id = ? AND status != 'paid'
         `).bind(orderId).run();
+      }
+    } else if (eventType === 'refund.processed') {
+      // 1. Only confirmed processed refunds update the order status
+      // 2. refund.created is deliberately excluded to prevent premature state changes
+      const refundStatus = refundEntity?.status;
+      const refundAmount = typeof refundEntity?.amount === 'number' ? refundEntity.amount : 0;
+      const expectedAmountPaise = parseInt(env.PRODUCT_PRICE || '149', 10) * 100;
+      const paymentAmountRefunded = typeof paymentEntity?.amount_refunded === 'number'
+        ? paymentEntity.amount_refunded
+        : refundAmount;
+
+      if (env.DB && (orderId || paymentId) && (!refundStatus || refundStatus === 'processed')) {
+        // Distinguish full refund from partial refund
+        const isFullRefund = paymentAmountRefunded >= expectedAmountPaise || refundAmount >= expectedAmountPaise;
+        const targetStatus = isFullRefund ? 'refunded' : 'partially_refunded';
+
+        await env.DB.prepare(`
+          UPDATE orders
+          SET status = ?,
+              updated_at = datetime('now')
+          WHERE ((razorpay_order_id = ? AND ? != '') OR (razorpay_payment_id = ? AND ? != ''))
+            AND status != 'refunded'
+        `).bind(targetStatus, orderId || '', orderId || '', paymentId || '', paymentId || '').run();
+      }
+    } else if (eventType === 'payment.dispute.created' || eventType === 'payment.dispute.lost') {
+      // Record payment disputes / chargebacks without granting fulfilment
+      if (env.DB && (orderId || paymentId)) {
+        await env.DB.prepare(`
+          UPDATE orders
+          SET status = 'disputed',
+              updated_at = datetime('now')
+          WHERE ((razorpay_order_id = ? AND ? != '') OR (razorpay_payment_id = ? AND ? != ''))
+        `).bind(orderId || '', orderId || '', paymentId || '', paymentId || '').run();
       }
     }
 

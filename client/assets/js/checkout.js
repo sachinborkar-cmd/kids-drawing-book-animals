@@ -1,6 +1,7 @@
 /**
  * Razorpay Checkout Controller
- * Manages order creation, Razorpay Standard Checkout modal, payment verification, and redirect.
+ * Manages dynamic runtime configuration, order creation, Razorpay Standard Checkout modal,
+ * payment verification, and redirect.
  */
 (function(window) {
   'use strict';
@@ -11,6 +12,8 @@
     errorEl: null,
     submitBtn: null,
     currentOrderId: null,
+    serverConfig: null,
+    keyId: null,
 
     init: function() {
       this.modal = document.getElementById('checkout-modal');
@@ -31,6 +34,29 @@
 
       if (this.form) {
         this.form.addEventListener('submit', (e) => this.handleSubmit(e));
+      }
+
+      // Pre-fetch dynamic public configuration
+      this.loadConfig().catch(() => {});
+    },
+
+    loadConfig: async function() {
+      try {
+        const res = await fetch('/api/config');
+        if (!res.ok) {
+          throw new Error('HTTP ' + res.status);
+        }
+        const data = await res.json();
+        if (data && data.success) {
+          this.serverConfig = data;
+          if (data.razorpay?.keyId) {
+            this.keyId = data.razorpay.keyId;
+          }
+        }
+        return data;
+      } catch (err) {
+        console.warn('[Checkout Config Load]: Failed to fetch /api/config:', err.message);
+        return null;
       }
     },
 
@@ -57,6 +83,7 @@
       if (!this.modal) return;
       this.modal.classList.remove('active');
       document.body.style.overflow = '';
+      this.setLoading(false);
     },
 
     showError: function(msg) {
@@ -68,7 +95,7 @@
     setLoading: function(isLoading) {
       if (!this.submitBtn) return;
       this.submitBtn.disabled = isLoading;
-      const priceText = window.PRODUCT_CONFIG?.pricing.displayPrice || '₹149';
+      const priceText = window.PRODUCT_CONFIG?.pricing?.displayPrice || '₹149';
       this.submitBtn.textContent = isLoading ? 'Creating Secure Order...' : `Proceed to Pay • ${priceText}`;
     },
 
@@ -95,6 +122,29 @@
       this.setLoading(true);
       if (this.errorEl) this.errorEl.style.display = 'none';
 
+      // 1. Ensure Razorpay SDK script is available
+      if (typeof window.Razorpay === 'undefined') {
+        this.showError('Payment gateway could not be loaded. Please refresh the page or try again.');
+        this.setLoading(false);
+        return;
+      }
+
+      // 2. Fetch server configuration if not already loaded
+      if (!this.serverConfig) {
+        await this.loadConfig();
+      }
+
+      // 3. Reject if active key is missing or is placeholder (unless explicit local dev mock)
+      const activeKey = this.keyId || this.serverConfig?.razorpay?.keyId || window.PRODUCT_CONFIG?.razorpay?.keyId;
+      const isLocalHost = typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+      const isExplicitLocalMock = isLocalHost && window.PRODUCT_CONFIG?.allowLocalMock === true;
+
+      if ((!activeKey || activeKey.includes('placeholder')) && !isExplicitLocalMock) {
+        this.showError('Payment gateway is currently unavailable. Please refresh the page or try again later.');
+        this.setLoading(false);
+        return;
+      }
+
       try {
         // Step 1: Request Order Creation from Backend
         const res = await fetch('/api/create-order', {
@@ -103,7 +153,7 @@
           body: JSON.stringify({ name, email, phone })
         });
 
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
         if (!res.ok || !data.success) {
           throw new Error(data.error || 'Failed to initialize order. Please try again.');
         }
@@ -121,13 +171,30 @@
     },
 
     launchRazorpay: function(orderData, customer) {
-      const cfg = window.PRODUCT_CONFIG;
-      const keyId = orderData.key_id || cfg.razorpay.keyId;
+      const cfg = window.PRODUCT_CONFIG || {};
+      const keyId = orderData.key_id || this.keyId || cfg.razorpay?.keyId;
 
-      // Handle Development Mock Mode (if using test placeholder keys)
-      if (keyId.includes('placeholder') || typeof window.Razorpay === 'undefined') {
-        console.info('[Checkout]: Razorpay running in test/mock mode.');
+      const isLocalHost = typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+      const isExplicitLocalMock = isLocalHost && cfg.allowLocalMock === true;
+
+      // Handle local development mock mode strictly when explicitly enabled on localhost
+      if (isExplicitLocalMock && (keyId?.includes('placeholder') || typeof window.Razorpay === 'undefined')) {
+        console.info('[Checkout]: Running in explicit local development mock mode.');
         this.simulateSuccessfulPayment(orderData, customer);
+        return;
+      }
+
+      // In production and preview environments, strictly require Razorpay SDK
+      if (typeof window.Razorpay === 'undefined') {
+        this.showError('Payment gateway could not be loaded. Please refresh the page or try again.');
+        this.setLoading(false);
+        return;
+      }
+
+      // Reject placeholder key in production/preview
+      if (!keyId || keyId.includes('placeholder')) {
+        this.showError('Payment gateway is currently unavailable. Please refresh the page or try again later.');
+        this.setLoading(false);
         return;
       }
 
@@ -135,7 +202,7 @@
         key: keyId,
         amount: orderData.amount,
         currency: orderData.currency || 'INR',
-        name: cfg.title,
+        name: cfg.title || 'Kids Drawing Book – Animals',
         description: '22-Page Activity Book PDF Download',
         image: '/assets/images/book-cover.png',
         order_id: orderData.razorpay_order_id,
@@ -145,7 +212,7 @@
           contact: customer.phone
         },
         theme: {
-          color: cfg.razorpay.themeColor || '#FF914D'
+          color: cfg.razorpay?.themeColor || '#FF914D'
         },
         handler: async (response) => {
           await this.verifyPayment(response, customer);
@@ -162,13 +229,13 @@
         const rzp = new window.Razorpay(options);
         rzp.on('payment.failed', (resp) => {
           console.error('[Payment Failed]:', resp.error);
-          this.showError(`Payment Failed: ${resp.error.description || 'Transaction was declined.'} You can retry payment.`);
+          this.showError(`Payment Failed: ${resp.error?.description || 'Transaction was declined.'} You can retry payment.`);
           this.setLoading(false);
         });
         rzp.open();
       } catch (e) {
         console.error('[Razorpay Launch Exception]:', e);
-        this.showError('Unable to open payment modal. Please try again or use direct checkout.');
+        this.showError('Unable to open payment modal. Please refresh the page or try again.');
         this.setLoading(false);
       }
     },
@@ -189,8 +256,8 @@
           })
         });
 
-        const data = await res.json();
-        if (!res.ok || !data.success) {
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.success || !data.redirect_url) {
           throw new Error(data.error || 'Payment verification failed. Please contact support.');
         }
 
@@ -198,12 +265,12 @@
         if (window.Analytics) {
           window.Analytics.trackPurchase(
             this.currentOrderId,
-            window.PRODUCT_CONFIG?.pricing.price,
-            window.PRODUCT_CONFIG?.pricing.currency
+            window.PRODUCT_CONFIG?.pricing?.price || 149,
+            window.PRODUCT_CONFIG?.pricing?.currency || 'INR'
           );
         }
 
-        // Redirect to Thank You + Download Page
+        // Redirect to Thank You + Download Page only after verified success
         window.location.href = data.redirect_url;
 
       } catch (err) {
@@ -213,7 +280,7 @@
       }
     },
 
-    // Development / Demo Simulation Fallback
+    // Development Mock Simulation: strictly isolated to explicit local mock on localhost
     simulateSuccessfulPayment: async function(orderData, customer) {
       if (this.submitBtn) this.submitBtn.textContent = 'Processing Demo Payment...';
       setTimeout(async () => {
@@ -230,9 +297,12 @@
             })
           });
 
-          const data = await res.json();
-          if (data.redirect_url) {
+          const data = await res.json().catch(() => ({}));
+          if (res.ok && data.success && data.redirect_url) {
             window.location.href = data.redirect_url;
+          } else {
+            this.showError(data.error || 'Demo payment simulation failed.');
+            this.setLoading(false);
           }
         } catch (e) {
           this.showError('Demo payment simulation completed. Check console.');
