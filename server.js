@@ -21,7 +21,7 @@ const CLIENT_DIR = path.join(__dirname, 'client');
 
 // Simulated Cloudflare env bindings
 const mockEnv = {
-  PRODUCT_PRICE: process.env.PRODUCT_PRICE || '149',
+  PRODUCT_PRICE: process.env.PRODUCT_PRICE || '1',
   PRODUCT_CURRENCY: process.env.PRODUCT_CURRENCY || 'INR',
   RAZORPAY_KEY_ID: process.env.RAZORPAY_KEY_ID || 'rzp_test_placeholder',
   RAZORPAY_KEY_SECRET: process.env.RAZORPAY_KEY_SECRET || '',

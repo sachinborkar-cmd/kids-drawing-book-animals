@@ -95,7 +95,7 @@
     setLoading: function(isLoading) {
       if (!this.submitBtn) return;
       this.submitBtn.disabled = isLoading;
-      const priceText = window.PRODUCT_CONFIG?.pricing?.displayPrice || '₹149';
+      const priceText = window.PRODUCT_CONFIG?.pricing?.displayPrice || '₹1';
       this.submitBtn.textContent = isLoading ? 'Creating Secure Order...' : `Proceed to Pay • ${priceText}`;
     },
 
@@ -103,21 +103,24 @@
       e.preventDefault();
       const name = document.getElementById('cust-name')?.value.trim();
       const email = document.getElementById('cust-email')?.value.trim();
-      const phoneInput = document.getElementById('cust-phone')?.value.trim();
+      const confirmEmail = document.getElementById('cust-email-confirm')?.value.trim();
 
       if (!email || !email.includes('@')) {
         this.showError('Please enter a valid email address.');
         return;
       }
 
-      let phone = '';
-      if (phoneInput && phoneInput.length > 0) {
-        if (!/^\d{10}$/.test(phoneInput)) {
-          this.showError('Please enter a valid 10-digit mobile number, or leave it blank.');
-          return;
-        }
-        phone = phoneInput;
+      if (!confirmEmail) {
+        this.showError('Please confirm your email address.');
+        return;
       }
+
+      if (email.toLowerCase() !== confirmEmail.toLowerCase()) {
+        this.showError('Email addresses do not match. Please verify both fields.');
+        return;
+      }
+
+      const verifiedEmail = email.toLowerCase();
 
       this.setLoading(true);
       if (this.errorEl) this.errorEl.style.display = 'none';
@@ -150,7 +153,7 @@
         const res = await fetch('/api/create-order', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name, email, phone })
+          body: JSON.stringify({ name, email: verifiedEmail })
         });
 
         const data = await res.json().catch(() => ({}));
@@ -161,7 +164,7 @@
         this.currentOrderId = data.order_id;
 
         // Step 2: Open Razorpay Checkout Modal
-        this.launchRazorpay(data, { name, email, phone });
+        this.launchRazorpay(data, { name, email: verifiedEmail });
 
       } catch (err) {
         console.error('[Checkout Error]:', err);
@@ -208,8 +211,7 @@
         order_id: orderData.razorpay_order_id,
         prefill: {
           name: customer.name,
-          email: customer.email,
-          contact: customer.phone
+          email: customer.email
         },
         theme: {
           color: cfg.razorpay?.themeColor || '#FF914D'
@@ -265,7 +267,7 @@
         if (window.Analytics) {
           window.Analytics.trackPurchase(
             this.currentOrderId,
-            window.PRODUCT_CONFIG?.pricing?.price || 149,
+            window.PRODUCT_CONFIG?.pricing?.price || 1,
             window.PRODUCT_CONFIG?.pricing?.currency || 'INR'
           );
         }

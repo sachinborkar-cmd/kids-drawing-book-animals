@@ -30,7 +30,7 @@ document.addEventListener('DOMContentLoaded', async function() {
   if (window.Analytics && orderId) {
     window.Analytics.trackPurchase(
       orderId,
-      window.PRODUCT_CONFIG?.pricing.price || 149,
+      window.PRODUCT_CONFIG?.pricing.price || 1,
       window.PRODUCT_CONFIG?.pricing.currency || 'INR'
     );
   }

@@ -143,14 +143,28 @@ export async function onRequestPost(context) {
       // 2. refund.created is deliberately excluded to prevent premature state changes
       const refundStatus = refundEntity?.status;
       const refundAmount = typeof refundEntity?.amount === 'number' ? refundEntity.amount : 0;
-      const expectedAmountPaise = parseInt(env.PRODUCT_PRICE || '149', 10) * 100;
       const paymentAmountRefunded = typeof paymentEntity?.amount_refunded === 'number'
         ? paymentEntity.amount_refunded
         : refundAmount;
 
       if (env.DB && (orderId || paymentId) && (!refundStatus || refundStatus === 'processed')) {
-        // Distinguish full refund from partial refund
-        const isFullRefund = paymentAmountRefunded >= expectedAmountPaise || refundAmount >= expectedAmountPaise;
+        // Query stored order to determine its actual original purchase amount from D1
+        let orderExpectedPaise = parseInt(env.PRODUCT_PRICE || '1', 10) * 100;
+        try {
+          const storedOrder = await env.DB.prepare(`
+            SELECT amount FROM orders
+            WHERE (razorpay_order_id = ? AND ? != '') OR (razorpay_payment_id = ? AND ? != '')
+          `).bind(orderId || '', orderId || '', paymentId || '', paymentId || '').first();
+
+          if (storedOrder && typeof storedOrder.amount === 'number' && storedOrder.amount > 0) {
+            orderExpectedPaise = storedOrder.amount * 100;
+          }
+        } catch (dbErr) {
+          console.warn('[D1 Refund Query Warning]:', dbErr.message);
+        }
+
+        // Distinguish full refund from partial refund based on the order's own original purchase amount
+        const isFullRefund = paymentAmountRefunded >= orderExpectedPaise || refundAmount >= orderExpectedPaise;
         const targetStatus = isFullRefund ? 'refunded' : 'partially_refunded';
 
         await env.DB.prepare(`

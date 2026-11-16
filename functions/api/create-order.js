@@ -14,6 +14,8 @@ export async function onRequestPost({ request, env }) {
       });
     }
 
+    const normalizedEmail = email.trim().toLowerCase();
+
     // Validate phone number: Optional, but if provided, must be exactly 10 numeric digits
     let validatedPhone = '';
     if (phone !== undefined && phone !== null) {
@@ -32,7 +34,7 @@ export async function onRequestPost({ request, env }) {
       }
     }
 
-    const price = parseInt(env.PRODUCT_PRICE || '149', 10);
+    const price = parseInt(env.PRODUCT_PRICE || '1', 10);
     const currency = env.PRODUCT_CURRENCY || 'INR';
     const amountInPaise = price * 100;
     const rawKeyId = typeof env.RAZORPAY_KEY_ID === 'string' ? env.RAZORPAY_KEY_ID.trim() : '';
@@ -93,7 +95,7 @@ export async function onRequestPost({ request, env }) {
           receipt: receipt,
           notes: {
             customer_name: name || '',
-            customer_email: email,
+            customer_email: normalizedEmail,
             customer_phone: validatedPhone,
             product: 'kids-drawing-book-animals'
           }
@@ -135,7 +137,7 @@ export async function onRequestPost({ request, env }) {
         await env.DB.prepare(`
           INSERT INTO orders (id, razorpay_order_id, customer_name, customer_email, customer_phone, amount, currency, status)
           VALUES (?, ?, ?, ?, ?, ?, ?, 'created')
-        `).bind(localOrderId, razorpayOrderId, name || '', email, validatedPhone, price, currency).run();
+        `).bind(localOrderId, razorpayOrderId, name || '', normalizedEmail, validatedPhone, price, currency).run();
       } catch (dbErr) {
         console.warn('[D1 Order Insert Warning]:', dbErr.message);
       }
@@ -150,7 +152,7 @@ export async function onRequestPost({ request, env }) {
       key_id: rawKeyId,
       customer: {
         name: name || '',
-        email: email,
+        email: normalizedEmail,
         phone: validatedPhone
       }
     }), {

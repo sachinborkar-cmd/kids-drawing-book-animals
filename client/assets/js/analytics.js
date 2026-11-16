@@ -151,7 +151,7 @@
       }
 
       const p = window.PRODUCT_CONFIG;
-      const finalAmount = amount || p?.pricing.price || 149;
+      const finalAmount = amount || p?.pricing.price || 1;
       const finalCurrency = currency || p?.pricing.currency || 'INR';
 
       const payload = {

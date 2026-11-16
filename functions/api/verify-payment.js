@@ -84,7 +84,7 @@ export async function onRequestPost(context) {
       }
     }
 
-    // 1. Order ID matching check
+    // 1. Order ID matching check & existing paid order token preservation
     if (existingOrder) {
       if (existingOrder.razorpay_order_id && existingOrder.razorpay_order_id !== razorpay_order_id) {
         return new Response(JSON.stringify({
@@ -97,8 +97,21 @@ export async function onRequestPost(context) {
         });
       }
 
+      // Idempotency: If already paid, preserve existing download token (unaffected by subsequent price changes)
+      if (existingOrder.status === 'paid' && existingOrder.download_token) {
+        return new Response(JSON.stringify({
+          success: true,
+          verified: true,
+          order_id: existingOrder.id,
+          download_token: existingOrder.download_token,
+          redirect_url: `/thank-you/?order_id=${encodeURIComponent(existingOrder.id)}&token=${encodeURIComponent(existingOrder.download_token)}`
+        }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+
       // 2. Amount and currency check against stored D1 order
-      const expectedPrice = parseInt(env.PRODUCT_PRICE || '149', 10);
+      const expectedPrice = parseInt(env.PRODUCT_PRICE || '1', 10);
       const expectedCurrency = env.PRODUCT_CURRENCY || 'INR';
 
       if (existingOrder.amount && existingOrder.amount !== expectedPrice) {
@@ -119,19 +132,6 @@ export async function onRequestPost(context) {
           error: 'Payment currency mismatch.'
         }), {
           status: 400,
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-
-      // 3. Idempotency & existing download token preservation: If already paid, return existing token
-      if (existingOrder.status === 'paid' && existingOrder.download_token) {
-        return new Response(JSON.stringify({
-          success: true,
-          verified: true,
-          order_id: existingOrder.id,
-          download_token: existingOrder.download_token,
-          redirect_url: `/thank-you/?order_id=${encodeURIComponent(existingOrder.id)}&token=${encodeURIComponent(existingOrder.download_token)}`
-        }), {
           headers: { 'Content-Type': 'application/json' }
         });
       }
@@ -219,8 +219,8 @@ export async function onRequestPost(context) {
         });
       }
 
-      // Verify amount is exactly 14900 paise (149 INR)
-      const expectedAmountPaise = parseInt(env.PRODUCT_PRICE || '149', 10) * 100;
+      // Verify amount matches expected configured amount in paise (e.g. 100 paise = 1 INR)
+      const expectedAmountPaise = parseInt(env.PRODUCT_PRICE || '1', 10) * 100;
       if (paymentData.amount !== expectedAmountPaise) {
         return new Response(JSON.stringify({
           success: false,

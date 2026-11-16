@@ -15,7 +15,7 @@ const PRODUCT_CONFIG = {
   pricing: {
     currency: 'INR',
     currencySymbol: '₹',
-    price: 149,          // Current selling price (INR)
+    price: 1,            // Current selling price (INR)
     originalPrice: 299,  // Regular price
     get displayPrice() {
       return `${this.currencySymbol}${this.price}`;

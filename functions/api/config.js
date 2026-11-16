@@ -3,7 +3,7 @@
  * Returns public store configuration (price, currency, Razorpay key_id)
  */
 export async function onRequestGet({ env }) {
-  const price = parseInt(env.PRODUCT_PRICE || '149', 10);
+  const price = parseInt(env.PRODUCT_PRICE || '1', 10);
   const currency = env.PRODUCT_CURRENCY || 'INR';
   const keyId = env.RAZORPAY_KEY_ID || 'rzp_test_placeholder';
   const supportEmail = env.SUPPORT_EMAIL || 'trenzy.helpme@gmail.com';
