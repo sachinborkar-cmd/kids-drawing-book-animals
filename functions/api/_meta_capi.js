@@ -151,7 +151,7 @@ export async function buildCapiPurchasePayload(order, env, requestContext = {}) 
   };
 
   // 3. Event Time (Unix epoch seconds from verified payment capture timestamp)
-  const rawPaidAt = order.paid_at || requestContext.paidAt || requestContext.paymentCreatedAt;
+  const rawPaidAt = order.paid_at || requestContext.paidAt;
   const eventTime = parseUtcToUnixSeconds(rawPaidAt);
   if (!eventTime) {
     throw new Error(`Order ${order.id} is missing a valid payment capture timestamp (paid_at)`);
@@ -214,6 +214,11 @@ export async function ensureCapiEventsTable(db) {
   } catch (err) {
     // Column already exists or permission restricted - non-fatal
   }
+  try {
+    await db.prepare(`ALTER TABLE orders ADD COLUMN paid_at_source TEXT;`).run();
+  } catch (err) {
+    // Column already exists or permission restricted - non-fatal
+  }
 }
 
 /**
@@ -233,7 +238,7 @@ export function sanitizeErrorMessage(err) {
  * 
  * @param {string} orderId - Stored order ID (e.g. ord_UUID) or razorpay_order_id
  * @param {object} env - Cloudflare environment bindings
- * @param {object} requestContext - Context metadata (clientIp, userAgent, sourceUrl, customFetch, paidAt, paymentCreatedAt)
+ * @param {object} requestContext - Context metadata (clientIp, userAgent, sourceUrl, customFetch, paidAt, paidAtSource)
  * @returns {Promise<object>} Result status object
  */
 export async function sendCapiPurchaseEvent(orderId, env, requestContext = {}) {
@@ -254,7 +259,7 @@ export async function sendCapiPurchaseEvent(orderId, env, requestContext = {}) {
   let order;
   try {
     order = await env.DB.prepare(`
-      SELECT id, razorpay_order_id, razorpay_payment_id, customer_name, customer_email, customer_phone, amount, currency, status, created_at, paid_at
+      SELECT id, razorpay_order_id, razorpay_payment_id, customer_name, customer_email, customer_phone, amount, currency, status, created_at, paid_at, paid_at_source
       FROM orders
       WHERE id = ? OR razorpay_order_id = ?
     `).bind(cleanOrderId, cleanOrderId).first();
@@ -295,7 +300,7 @@ export async function sendCapiPurchaseEvent(orderId, env, requestContext = {}) {
   }
 
   // 5. Validate verified payment capture timestamp (paid_at)
-  const rawPaidAt = order.paid_at || requestContext.paidAt || requestContext.paymentCreatedAt;
+  const rawPaidAt = order.paid_at || requestContext.paidAt;
   const verifiedEventTime = parseUtcToUnixSeconds(rawPaidAt);
   if (!verifiedEventTime) {
     return {

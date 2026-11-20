@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS orders (
   download_token TEXT UNIQUE,
   download_count INTEGER NOT NULL DEFAULT 0,
   paid_at TEXT,
+  paid_at_source TEXT, -- 'webhook' (authoritative capture event), 'verify_approx' (verification fallback)
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );

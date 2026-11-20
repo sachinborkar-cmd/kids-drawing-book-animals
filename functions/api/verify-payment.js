@@ -76,7 +76,7 @@ export async function onRequestPost(context) {
     if (env.DB) {
       try {
         existingOrder = await env.DB.prepare(`
-          SELECT id, razorpay_order_id, customer_email, amount, currency, status, download_token, paid_at
+          SELECT id, razorpay_order_id, customer_email, amount, currency, status, download_token, paid_at, paid_at_source
           FROM orders
           WHERE id = ? OR razorpay_order_id = ?
         `).bind(targetOrderId, razorpay_order_id).first();
@@ -106,6 +106,7 @@ export async function onRequestPost(context) {
           userAgent: request.headers?.get ? request.headers.get('user-agent') : null,
           sourceUrl: `https://${(request.headers?.get ? request.headers.get('host') : null) || 'ebooks.trenzy.store'}/thank-you/?order_id=${encodeURIComponent(existingOrder.id)}`,
           paidAt: existingOrder.paid_at,
+          paidAtSource: existingOrder.paid_at_source || 'verify_approx',
           customFetch: env.customFetch
         };
         const earlyCapiPromise = sendCapiPurchaseEvent(existingOrder.id, env, earlyCapiContext);
@@ -287,21 +288,22 @@ export async function onRequestPost(context) {
       }
     }
 
-    // Extract verified payment capture timestamp
-    let capturedIso = null;
-    if (paymentData && typeof paymentData.created_at === 'number' && paymentData.created_at > 0) {
-      capturedIso = new Date(paymentData.created_at * 1000).toISOString();
-    } else if (paymentData && paymentData.created_at) {
-      const parsed = Number(paymentData.created_at);
-      if (!Number.isNaN(parsed) && parsed > 0) {
-        capturedIso = new Date(parsed * 1000).toISOString();
-      }
-    }
-    if (!capturedIso && existingOrder?.paid_at) {
-      capturedIso = existingOrder.paid_at;
-    }
-    if (!capturedIso && isPlaceholder) {
-      capturedIso = new Date().toISOString();
+    // Determine payment capture timestamp (authoritative webhook vs server-side verification approximation)
+    let canonicalPaidAt = null;
+    let canonicalSource = null;
+
+    if (existingOrder?.paid_at_source === 'webhook' && existingOrder.paid_at) {
+      // Authoritative webhook timestamp already recorded; preserve it
+      canonicalPaidAt = existingOrder.paid_at;
+      canonicalSource = 'webhook';
+    } else if (existingOrder?.paid_at) {
+      // Previous verification timestamp already recorded; preserve it
+      canonicalPaidAt = existingOrder.paid_at;
+      canonicalSource = existingOrder.paid_at_source || 'verify_approx';
+    } else {
+      // No authoritative capture timestamp is available; use server-side verification timestamp as approximation
+      canonicalPaidAt = new Date().toISOString();
+      canonicalSource = 'verify_approx';
     }
 
     // Generate secure random download token (or preserve existing)
@@ -321,10 +323,19 @@ export async function onRequestPost(context) {
               razorpay_payment_id = ?,
               razorpay_signature = ?,
               download_token = COALESCE(download_token, ?),
-              paid_at = COALESCE(paid_at, ?),
+              paid_at = CASE
+                          WHEN paid_at_source = 'webhook' THEN paid_at
+                          WHEN paid_at IS NOT NULL THEN paid_at
+                          ELSE ?
+                        END,
+              paid_at_source = CASE
+                                 WHEN paid_at_source = 'webhook' THEN paid_at_source
+                                 WHEN paid_at IS NOT NULL THEN paid_at_source
+                                 ELSE 'verify_approx'
+                               END,
               updated_at = datetime('now')
           WHERE razorpay_order_id = ? OR id = ?
-        `).bind(razorpay_payment_id, razorpay_signature || '', downloadToken, capturedIso, razorpay_order_id, targetOrderId).run();
+        `).bind(razorpay_payment_id, razorpay_signature || '', downloadToken, canonicalPaidAt, razorpay_order_id, targetOrderId).run();
 
         // Asynchronously dispatch purchase confirmation email with PDF attachment
         // Production environment detection takes precedence; staging/unknown/conflicting environments fail closed
@@ -348,8 +359,8 @@ export async function onRequestPost(context) {
           clientIp: request.headers?.get ? (request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for')) : null,
           userAgent: request.headers?.get ? request.headers.get('user-agent') : null,
           sourceUrl: `https://${(request.headers?.get ? request.headers.get('host') : null) || 'ebooks.trenzy.store'}/thank-you/?order_id=${encodeURIComponent(targetOrderId)}`,
-          paidAt: capturedIso,
-          paymentCreatedAt: paymentData?.created_at,
+          paidAt: canonicalPaidAt,
+          paidAtSource: canonicalSource,
           customFetch: env.customFetch
         };
         const capiPromise = sendCapiPurchaseEvent(targetOrderId, env, capiContext);

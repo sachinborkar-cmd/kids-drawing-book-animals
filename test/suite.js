@@ -90,11 +90,49 @@ class MockD1 {
               status: status || 'created',
               download_token: null,
               download_count: 0,
-              paid_at: null
+              paid_at: null,
+              paid_at_source: null
             });
             return { success: true };
           }
           if (q.startsWith('UPDATE orders') && q.includes("status = 'paid'")) {
+            if (q.includes("razorpay_signature = ?")) {
+              let payment_id, signature, token, approxIso, rzp_order_id, targetOrderId;
+              if (args.length === 6) {
+                [payment_id, signature, token, approxIso, rzp_order_id, targetOrderId] = args;
+              } else {
+                [payment_id, signature, token, rzp_order_id, targetOrderId] = args;
+              }
+              const rec = this.orders.get(rzp_order_id) || Array.from(this.orders.values()).find(o => o.id === rzp_order_id || o.id === targetOrderId || o.razorpay_order_id === rzp_order_id || o.razorpay_order_id === targetOrderId);
+              if (rec) {
+                rec.status = 'paid';
+                rec.razorpay_payment_id = payment_id;
+                rec.razorpay_signature = signature;
+                rec.download_token = rec.download_token || token;
+                if (approxIso && rec.paid_at_source !== 'webhook' && !rec.paid_at) {
+                  rec.paid_at = approxIso;
+                  rec.paid_at_source = 'verify_approx';
+                }
+              }
+              return { success: true };
+            }
+            if (q.includes("paid_at_source = 'webhook'") || (q.includes("download_token = COALESCE(download_token, ?)") && args.length === 6)) {
+              const [payment_id, token, authIso1, authIso2, authIso3, rzp_order_id] = args;
+              const rec = this.orders.get(rzp_order_id) || Array.from(this.orders.values()).find(o => o.id === rzp_order_id || o.razorpay_order_id === rzp_order_id);
+              if (rec) {
+                rec.status = 'paid';
+                rec.razorpay_payment_id = rec.razorpay_payment_id || payment_id;
+                rec.download_token = rec.download_token || token;
+                if (!rec.paid_at || rec.paid_at_source !== 'webhook') {
+                  rec.paid_at = authIso1;
+                  rec.paid_at_source = 'webhook';
+                } else if (authIso2 > rec.paid_at) {
+                  rec.paid_at = authIso3;
+                  rec.paid_at_source = 'webhook';
+                }
+              }
+              return { success: true };
+            }
             if (args.length === 3) {
               const [payment_id, token, rzp_order_id] = args;
               const rec = this.orders.get(rzp_order_id) || Array.from(this.orders.values()).find(o => o.id === rzp_order_id);
@@ -138,7 +176,7 @@ class MockD1 {
             }
             return { success: true };
           }
-          if (q.startsWith('ALTER TABLE orders ADD COLUMN paid_at')) {
+          if (q.startsWith('ALTER TABLE orders ADD COLUMN')) {
             return { success: true };
           }
           if (q.startsWith('UPDATE orders') && q.includes("status = 'failed'")) {
@@ -4501,6 +4539,7 @@ await test('verify-payment and webhook payment capture paths preserve paid_at us
   const eventPayload = {
     event: 'payment.captured',
     event_id: `evt_coalesce_${Date.now()}`,
+    created_at: initialCapturedEpoch,
     payload: {
       payment: {
         entity: {
@@ -4508,8 +4547,7 @@ await test('verify-payment and webhook payment capture paths preserve paid_at us
           order_id: rzpOrderId,
           status: 'captured',
           amount: 100,
-          currency: 'INR',
-          created_at: initialCapturedEpoch
+          currency: 'INR'
         }
       }
     }
@@ -4581,6 +4619,334 @@ await test('Meta CAPI endpoint uses Graph API v26.0 by default', async () => {
   const res = await sendCapiPurchaseEvent(orderId, mockEnv);
   assert.equal(res.success, true);
   assert(globalThis.__lastMetaCapiCall.url.startsWith('https://graph.facebook.com/v26.0/'), 'URL must start with https://graph.facebook.com/v26.0/');
+});
+
+await test('Webhook event timestamp is preferred over verification fallback', async () => {
+  const orderId = `ord_wh_preferred_${Date.now()}`;
+  const rzpOrderId = `order_wh_pref_${Date.now()}`;
+  const rzpPaymentId = `pay_wh_pref_${Date.now()}`;
+  const whEventEpoch = 1795171111;
+  const whIso = new Date(whEventEpoch * 1000).toISOString();
+
+  mockDb.orders.set(rzpOrderId, {
+    id: orderId,
+    razorpay_order_id: rzpOrderId,
+    customer_email: 'pref@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'created',
+    paid_at: null,
+    paid_at_source: null
+  });
+
+  // 1. Authoritative webhook arrives first
+  const eventPayload = {
+    event: 'payment.captured',
+    event_id: `evt_pref_${Date.now()}`,
+    created_at: whEventEpoch,
+    payload: {
+      payment: {
+        entity: {
+          id: rzpPaymentId,
+          order_id: rzpOrderId,
+          status: 'captured',
+          amount: 100,
+          currency: 'INR'
+        }
+      }
+    }
+  };
+  const rawBody = JSON.stringify(eventPayload);
+  const sig = await computeWebhookSig(rawBody, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+
+  const whRes = await handleWebhook({
+    request: {
+      headers: new Headers({ 'x-razorpay-signature': sig }),
+      text: async () => rawBody
+    },
+    env: mockEnv
+  });
+  assert.equal(whRes.status, 200);
+
+  const orderAfterWh = mockDb.orders.get(rzpOrderId);
+  assert.equal(orderAfterWh.paid_at, whIso);
+  assert.equal(orderAfterWh.paid_at_source, 'webhook');
+
+  // 2. Later verify-payment arrives: MUST prefer and preserve webhook timestamp
+  const verifySig = await computeWebhookSig(`${rzpOrderId}|${rzpPaymentId}`, mockEnv.RAZORPAY_KEY_SECRET);
+  globalThis.__mockPaymentId = rzpPaymentId;
+  globalThis.__mockPaymentOrderId = rzpOrderId;
+  globalThis.__mockPaymentStatus = 'captured';
+  globalThis.__mockPaymentAmount = 100;
+  globalThis.__mockPaymentCurrency = 'INR';
+
+  const verifyRes = await handleVerifyPayment({
+    request: {
+      headers: new Headers({ 'cf-connecting-ip': '1.2.3.4' }),
+      json: async () => ({
+        order_id: orderId,
+        razorpay_order_id: rzpOrderId,
+        razorpay_payment_id: rzpPaymentId,
+        razorpay_signature: verifySig
+      })
+    },
+    env: mockEnv
+  });
+  delete globalThis.__mockPaymentId;
+  delete globalThis.__mockPaymentOrderId;
+  delete globalThis.__mockPaymentStatus;
+  delete globalThis.__mockPaymentAmount;
+  delete globalThis.__mockPaymentCurrency;
+
+  assert.equal(verifyRes.status, 200);
+  assert.equal(orderAfterWh.paid_at, whIso, 'Verification must not overwrite authoritative webhook timestamp');
+  assert.equal(orderAfterWh.paid_at_source, 'webhook');
+});
+
+await test('Verification fallback is used only when authoritative timestamp is unavailable', async () => {
+  const orderId = `ord_fallback_only_${Date.now()}`;
+  const rzpOrderId = `order_fb_only_${Date.now()}`;
+  const rzpPaymentId = `pay_fb_only_${Date.now()}`;
+
+  mockDb.orders.set(rzpOrderId, {
+    id: orderId,
+    razorpay_order_id: rzpOrderId,
+    customer_email: 'fallback@example.com',
+    amount: 149,
+    currency: 'INR',
+    status: 'created',
+    paid_at: null,
+    paid_at_source: null
+  });
+
+  const verifySig = await computeWebhookSig(`${rzpOrderId}|${rzpPaymentId}`, mockEnv.RAZORPAY_KEY_SECRET);
+  globalThis.__mockPaymentId = rzpPaymentId;
+  globalThis.__mockPaymentOrderId = rzpOrderId;
+  globalThis.__mockPaymentStatus = 'captured';
+  globalThis.__mockPaymentAmount = 14900;
+  globalThis.__mockPaymentCurrency = 'INR';
+
+  const beforeVerify = Date.now();
+  const verifyRes = await handleVerifyPayment({
+    request: {
+      headers: new Headers({ 'cf-connecting-ip': '1.2.3.4' }),
+      json: async () => ({
+        order_id: orderId,
+        razorpay_order_id: rzpOrderId,
+        razorpay_payment_id: rzpPaymentId,
+        razorpay_signature: verifySig
+      })
+    },
+    env: mockEnv
+  });
+  const afterVerify = Date.now();
+
+  delete globalThis.__mockPaymentId;
+  delete globalThis.__mockPaymentOrderId;
+  delete globalThis.__mockPaymentStatus;
+  delete globalThis.__mockPaymentAmount;
+  delete globalThis.__mockPaymentCurrency;
+
+  assert.equal(verifyRes.status, 200);
+  const storedOrder = mockDb.orders.get(rzpOrderId);
+  assert.equal(storedOrder.paid_at_source, 'verify_approx', 'Must be marked as verification approximation');
+  const storedTimeMs = new Date(storedOrder.paid_at).getTime();
+  assert(storedTimeMs >= beforeVerify - 2000 && storedTimeMs <= afterVerify + 2000, 'Timestamp must be approximate server time');
+});
+
+await test('Later authoritative timestamp replaces an approximate fallback', async () => {
+  const orderId = `ord_replace_approx_${Date.now()}`;
+  const rzpOrderId = `order_rep_ap_${Date.now()}`;
+  const rzpPaymentId = `pay_rep_ap_${Date.now()}`;
+  const approximateIso = '2026-11-20T12:00:00.000Z';
+  const authoritativeEpoch = 1795175940; // 2026-11-20T11:59:00.000Z
+  const authoritativeIso = new Date(authoritativeEpoch * 1000).toISOString();
+
+  // Order was verified earlier with approximate fallback
+  mockDb.orders.set(rzpOrderId, {
+    id: orderId,
+    razorpay_order_id: rzpOrderId,
+    customer_email: 'replace_approx@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid',
+    paid_at: approximateIso,
+    paid_at_source: 'verify_approx'
+  });
+
+  // Later authoritative webhook arrives
+  const eventPayload = {
+    event: 'payment.captured',
+    event_id: `evt_rep_ap_${Date.now()}`,
+    created_at: authoritativeEpoch,
+    payload: {
+      payment: {
+        entity: {
+          id: rzpPaymentId,
+          order_id: rzpOrderId,
+          status: 'captured',
+          amount: 100,
+          currency: 'INR'
+        }
+      }
+    }
+  };
+  const rawBody = JSON.stringify(eventPayload);
+  const sig = await computeWebhookSig(rawBody, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+
+  const whRes = await handleWebhook({
+    request: {
+      headers: new Headers({ 'x-razorpay-signature': sig }),
+      text: async () => rawBody
+    },
+    env: mockEnv
+  });
+  assert.equal(whRes.status, 200);
+
+  const storedOrder = mockDb.orders.get(rzpOrderId);
+  assert.equal(storedOrder.paid_at, authoritativeIso, 'Authoritative webhook timestamp must replace approximate fallback');
+  assert.equal(storedOrder.paid_at_source, 'webhook');
+});
+
+await test('Duplicate webhook does not change the timestamp', async () => {
+  const orderId = `ord_dup_wh_time_${Date.now()}`;
+  const rzpOrderId = `order_dup_wh_${Date.now()}`;
+  const rzpPaymentId = `pay_dup_wh_${Date.now()}`;
+  const originalEpoch = 1795174000;
+  const originalIso = new Date(originalEpoch * 1000).toISOString();
+
+  mockDb.orders.set(rzpOrderId, {
+    id: orderId,
+    razorpay_order_id: rzpOrderId,
+    customer_email: 'dup_wh@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'created',
+    paid_at: null,
+    paid_at_source: null
+  });
+
+  const eventPayload = {
+    event: 'payment.captured',
+    event_id: `evt_dup_wh_1_${Date.now()}`,
+    created_at: originalEpoch,
+    payload: {
+      payment: {
+        entity: {
+          id: rzpPaymentId,
+          order_id: rzpOrderId,
+          status: 'captured',
+          amount: 100,
+          currency: 'INR'
+        }
+      }
+    }
+  };
+  const rawBody1 = JSON.stringify(eventPayload);
+  const sig1 = await computeWebhookSig(rawBody1, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+
+  await handleWebhook({
+    request: {
+      headers: new Headers({ 'x-razorpay-signature': sig1 }),
+      text: async () => rawBody1
+    },
+    env: mockEnv
+  });
+
+  const orderAfterFirst = mockDb.orders.get(rzpOrderId);
+  assert.equal(orderAfterFirst.paid_at, originalIso);
+
+  // Duplicate webhook delivery with different event_id but same capture event created_at
+  const dupPayload = { ...eventPayload, event_id: `evt_dup_wh_2_${Date.now()}` };
+  const rawBody2 = JSON.stringify(dupPayload);
+  const sig2 = await computeWebhookSig(rawBody2, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+
+  await handleWebhook({
+    request: {
+      headers: new Headers({ 'x-razorpay-signature': sig2 }),
+      text: async () => rawBody2
+    },
+    env: mockEnv
+  });
+
+  assert.equal(orderAfterFirst.paid_at, originalIso, 'Duplicate webhook must not change timestamp');
+  assert.equal(orderAfterFirst.paid_at_source, 'webhook');
+});
+
+await test('Older webhook events cannot overwrite a newer authoritative timestamp', async () => {
+  const orderId = `ord_older_wh_${Date.now()}`;
+  const rzpOrderId = `order_older_wh_${Date.now()}`;
+  const rzpPaymentId = `pay_older_wh_${Date.now()}`;
+  const newerEpoch = 1795175000;
+  const newerIso = new Date(newerEpoch * 1000).toISOString();
+  const olderEpoch = 1795172000;
+
+  mockDb.orders.set(rzpOrderId, {
+    id: orderId,
+    razorpay_order_id: rzpOrderId,
+    customer_email: 'older_wh@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid',
+    paid_at: newerIso,
+    paid_at_source: 'webhook'
+  });
+
+  // Older webhook delivery
+  const olderPayload = {
+    event: 'payment.captured',
+    event_id: `evt_older_${Date.now()}`,
+    created_at: olderEpoch,
+    payload: {
+      payment: {
+        entity: {
+          id: rzpPaymentId,
+          order_id: rzpOrderId,
+          status: 'captured',
+          amount: 100,
+          currency: 'INR'
+        }
+      }
+    }
+  };
+  const rawBody = JSON.stringify(olderPayload);
+  const sig = await computeWebhookSig(rawBody, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+
+  await handleWebhook({
+    request: {
+      headers: new Headers({ 'x-razorpay-signature': sig }),
+      text: async () => rawBody
+    },
+    env: mockEnv
+  });
+
+  const storedOrder = mockDb.orders.get(rzpOrderId);
+  assert.equal(storedOrder.paid_at, newerIso, 'Older webhook event cannot overwrite newer authoritative timestamp');
+  assert.equal(storedOrder.paid_at_source, 'webhook');
+});
+
+await test('CAPI event_time uses the canonical timestamp', async () => {
+  const orderId = `ord_capi_canonical_${Date.now()}`;
+  const canonicalTimestamp = '2026-11-20T14:30:00.000Z';
+  const expectedUnixSeconds = parseUtcToUnixSeconds(canonicalTimestamp);
+
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: `rzp_canonical_test_${Date.now()}`,
+    customer_email: 'canonical_test@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid',
+    paid_at: canonicalTimestamp,
+    paid_at_source: 'webhook'
+  });
+
+  globalThis.__lastMetaCapiCall = null;
+  const res = await sendCapiPurchaseEvent(orderId, mockEnv);
+  assert.equal(res.success, true);
+  assert(globalThis.__lastMetaCapiCall, 'Meta API must be called');
+  const ev = globalThis.__lastMetaCapiCall.body.data[0];
+  assert.equal(ev.event_time, expectedUnixSeconds, 'CAPI event_time must match canonical timestamp in Unix seconds');
 });
 
 console.log('\n======================================================');

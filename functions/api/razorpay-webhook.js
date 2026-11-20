@@ -102,16 +102,18 @@ export async function onRequestPost(context) {
 
     if (eventType === 'payment.captured' || eventType === 'order.paid') {
       if (orderId && env.DB) {
-        // Extract verified payment capture timestamp
-        let capturedIso = null;
-        const rawCapturedAt = paymentEntity?.created_at || event.payload?.order?.entity?.created_at || event.created_at;
-        if (typeof rawCapturedAt === 'number' && rawCapturedAt > 0) {
-          capturedIso = new Date(rawCapturedAt * 1000).toISOString();
-        } else if (rawCapturedAt) {
-          const parsed = Number(rawCapturedAt);
+        // Extract authoritative payment capture timestamp from top-level webhook event.created_at
+        let authoritativeIso = null;
+        if (typeof event.created_at === 'number' && event.created_at > 0) {
+          authoritativeIso = new Date(event.created_at * 1000).toISOString();
+        } else if (event.created_at) {
+          const parsed = Number(event.created_at);
           if (!Number.isNaN(parsed) && parsed > 0) {
-            capturedIso = new Date(parsed * 1000).toISOString();
+            authoritativeIso = new Date(parsed * 1000).toISOString();
           }
+        }
+        if (!authoritativeIso) {
+          authoritativeIso = new Date().toISOString();
         }
 
         // Ensure order is marked paid and has a download token
@@ -124,10 +126,15 @@ export async function onRequestPost(context) {
           SET status = 'paid',
               razorpay_payment_id = COALESCE(razorpay_payment_id, ?),
               download_token = COALESCE(download_token, ?),
-              paid_at = COALESCE(paid_at, ?),
+              paid_at = CASE
+                          WHEN paid_at_source IS NULL OR paid_at_source != 'webhook' THEN ?
+                          WHEN ? > paid_at THEN ?
+                          ELSE paid_at
+                        END,
+              paid_at_source = 'webhook',
               updated_at = datetime('now')
           WHERE razorpay_order_id = ?
-        `).bind(paymentId || '', downloadToken, capturedIso, orderId).run();
+        `).bind(paymentId || '', downloadToken, authoritativeIso, authoritativeIso, authoritativeIso, orderId).run();
 
         // Asynchronously dispatch purchase confirmation email with PDF attachment
         // Production environment detection takes precedence; staging/unknown/conflicting environments fail closed
@@ -155,8 +162,8 @@ export async function onRequestPost(context) {
             clientIp: request.headers?.get ? request.headers.get('cf-connecting-ip') : null,
             userAgent: request.headers?.get ? request.headers.get('user-agent') : null,
             sourceUrl: `https://${(request.headers?.get ? request.headers.get('host') : null) || 'ebooks.trenzy.store'}/thank-you/?order_id=${encodeURIComponent(orderId)}`,
-            paidAt: capturedIso,
-            paymentCreatedAt: rawCapturedAt,
+            paidAt: authoritativeIso,
+            paidAtSource: 'webhook',
             customFetch: env.customFetch
           };
           const capiPromise = sendCapiPurchaseEvent(orderId, env, capiContext);
