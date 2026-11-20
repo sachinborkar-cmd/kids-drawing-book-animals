@@ -8,9 +8,10 @@
   const Analytics = {
     init: function() {
       const cfg = window.PRODUCT_CONFIG?.analytics || {};
+      const fbqAlreadyLoaded = typeof window.fbq === 'function';
 
-      // Initialize Meta Pixel if ID is configured
-      if (cfg.metaPixelId && !window.fbq) {
+      // Initialize Meta Pixel if ID is configured and not already loaded in <head>
+      if (cfg.metaPixelId && !fbqAlreadyLoaded) {
         /* eslint-disable */
         !function(f,b,e,v,n,t,s)
         {if(f.fbq)return;n=f.fbq=function(){n.callMethod?
@@ -38,15 +39,17 @@
       }
 
       // Track PageView automatically
-      this.trackPageView();
+      // If fbq was already loaded in <head>, the head snippet already invoked fbq('track', 'PageView').
+      // We pass skipMeta = true to prevent duplicate PageView on initial page load.
+      this.trackPageView(null, fbqAlreadyLoaded);
     },
 
     // 1. PageView
-    trackPageView: function(pagePath) {
+    trackPageView: function(pagePath, skipMeta) {
       const path = pagePath || window.location.pathname;
 
       // Meta Pixel
-      if (typeof window.fbq === 'function') {
+      if (typeof window.fbq === 'function' && !skipMeta) {
         window.fbq('track', 'PageView');
       }
 
@@ -77,8 +80,8 @@
         currency: p.pricing.currency
       };
 
-      // Meta Pixel
-      if (typeof window.fbq === 'function') {
+      // Meta Pixel (gated: conversion events not active until explicitly enabled)
+      if (typeof window.fbq === 'function' && window.PRODUCT_CONFIG?.analytics?.enableMetaConversions === true) {
         window.fbq('track', 'ViewContent', payload);
       }
 
@@ -114,8 +117,8 @@
         num_items: 1
       };
 
-      // Meta Pixel
-      if (typeof window.fbq === 'function') {
+      // Meta Pixel (gated: conversion events not active until explicitly enabled)
+      if (typeof window.fbq === 'function' && window.PRODUCT_CONFIG?.analytics?.enableMetaConversions === true) {
         window.fbq('track', 'InitiateCheckout', payload);
       }
 
@@ -164,8 +167,8 @@
         num_items: 1
       };
 
-      // Meta Pixel
-      if (typeof window.fbq === 'function') {
+      // Meta Pixel (gated: conversion events not active until explicitly enabled)
+      if (typeof window.fbq === 'function' && window.PRODUCT_CONFIG?.analytics?.enableMetaConversions === true) {
         window.fbq('track', 'Purchase', payload);
       }
 

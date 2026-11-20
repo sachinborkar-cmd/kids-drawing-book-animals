@@ -58,6 +58,14 @@ class MockD1 {
         run: async () => {
           if (q.startsWith('INSERT INTO orders')) {
             const [id, rzp_order_id, name, email, phone, amount, currency, status] = args;
+            // Enforce SQLite PRIMARY KEY (id) and UNIQUE (razorpay_order_id) constraints
+            const existingWithId = Array.from(this.orders.values()).find(o => o.id === id);
+            if (existingWithId) {
+              throw new Error('UNIQUE constraint failed: orders.id');
+            }
+            if (this.orders.has(rzp_order_id)) {
+              throw new Error('UNIQUE constraint failed: orders.razorpay_order_id');
+            }
             this.orders.set(rzp_order_id, {
               id,
               razorpay_order_id: rzp_order_id,
@@ -460,6 +468,101 @@ await test('POST /api/create-order phone validation (optional & exact 10 digits)
     env: mockEnv
   });
   assert.equal(resSpace.status, 400, 'Phone with spaces must be rejected with 400');
+});
+
+await test('POST /api/create-order generates collision-resistant unique order IDs under rapid concurrent creation', async () => {
+  const concurrentCount = 10;
+  const requests = Array.from({ length: concurrentCount }, (_, i) => ({
+    request: { json: async () => ({ name: `Concurrent User ${i}`, email: `user${i}@example.com` }) },
+    env: mockEnv
+  }));
+
+  const responses = await Promise.all(requests.map(req => handleCreateOrder(req)));
+  const orderIds = [];
+
+  for (const res of responses) {
+    assert.equal(res.status, 200);
+    const data = JSON.parse(await res.text());
+    assert(data.order_id.startsWith('ord_'), 'Order ID must preserve ord_ prefix');
+    orderIds.push(data.order_id);
+  }
+
+  const uniqueIds = new Set(orderIds);
+  assert.equal(uniqueIds.size, concurrentCount, 'All concurrent order IDs must be strictly unique');
+});
+
+await test('POST /api/create-order fails closed if D1 database insertion fails', async () => {
+  const failingDbEnv = {
+    ...mockEnv,
+    DB: {
+      prepare: () => ({
+        bind: () => ({
+          run: async () => {
+            throw new Error('D1 storage connection failure simulation');
+          }
+        })
+      })
+    }
+  };
+
+  const res = await handleCreateOrder({
+    request: { json: async () => ({ name: 'Failure Test', email: 'fail@example.com' }) },
+    env: failingDbEnv
+  });
+
+  assert.equal(res.status, 500, 'Must return HTTP 500 if database persistence fails');
+  const data = JSON.parse(await res.text());
+  assert.equal(data.success, false, 'Success must be false on persistence failure');
+});
+
+await test('POST /api/create-order fails closed (HTTP 500) if env.DB is missing in production or staging', async () => {
+  const noDbProdEnv = {
+    ...mockEnv,
+    DB: undefined
+  };
+
+  const resProd = await handleCreateOrder({
+    request: { json: async () => ({ name: 'No DB User', email: 'nodb@example.com' }) },
+    env: noDbProdEnv
+  });
+
+  assert.equal(resProd.status, 500, 'Must return HTTP 500 when env.DB is missing in production');
+  const prodData = JSON.parse(await resProd.text());
+  assert.equal(prodData.success, false);
+
+  const noDbStagingEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'staging',
+    ENVIRONMENT: 'staging',
+    DB: undefined
+  };
+
+  const resStaging = await handleCreateOrder({
+    request: { json: async () => ({ name: 'No DB User', email: 'nodb@example.com' }) },
+    env: noDbStagingEnv
+  });
+
+  assert.equal(resStaging.status, 500, 'Must return HTTP 500 when env.DB is missing in staging');
+  const stagingData = JSON.parse(await resStaging.text());
+  assert.equal(stagingData.success, false);
+});
+
+await test('POST /api/create-order fails closed (HTTP 500) if crypto.randomUUID is unavailable', async () => {
+  const origRandomUUID = globalThis.crypto?.randomUUID;
+  try {
+    globalThis.crypto.randomUUID = undefined;
+    const res = await handleCreateOrder({
+      request: { json: async () => ({ name: 'No Crypto User', email: 'nocrypto@example.com' }) },
+      env: mockEnv
+    });
+    assert.equal(res.status, 500, 'Must return HTTP 500 if crypto.randomUUID is unavailable');
+    const data = JSON.parse(await res.text());
+    assert.equal(data.success, false);
+  } finally {
+    if (origRandomUUID) {
+      globalThis.crypto.randomUUID = origRandomUUID;
+    }
+  }
 });
 
 // 3. RAZORPAY SECURITY & SIGNATURE AUDIT

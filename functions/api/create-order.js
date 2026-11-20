@@ -77,6 +77,18 @@ export async function onRequestPost({ request, env }) {
       }
     }
 
+    // 3. Database binding validation: fail closed if env.DB is missing in production or staging
+    if ((isProd || isPreview) && !env.DB) {
+      console.error('[Create Order Security Error]: Database binding (env.DB) is missing in staging/production.');
+      return new Response(JSON.stringify({
+        success: false,
+        error: 'Database service is unavailable. Checkout aborted for safety.'
+      }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
     const receipt = `rcpt_${Date.now().toString().slice(-8)}`;
     let razorpayOrderId = null;
 
@@ -129,18 +141,51 @@ export async function onRequestPost({ request, env }) {
       }
     }
 
-    const localOrderId = `ord_${Date.now()}`;
+    // Ensure cryptographic randomUUID generator is available
+    if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
+      console.error('[Create Order Security Error]: Cryptographic randomUUID generator is unavailable.');
+      return new Response(JSON.stringify({
+        success: false,
+        error: 'Cryptographic service unavailable.'
+      }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    const localOrderId = `ord_${crypto.randomUUID()}`;
 
     // Store in Cloudflare D1 if binding exists (stored in Rupees for clear accounting)
     if (env.DB) {
       try {
-        await env.DB.prepare(`
+        const d1Result = await env.DB.prepare(`
           INSERT INTO orders (id, razorpay_order_id, customer_name, customer_email, customer_phone, amount, currency, status)
           VALUES (?, ?, ?, ?, ?, ?, ?, 'created')
         `).bind(localOrderId, razorpayOrderId, name || '', normalizedEmail, validatedPhone, price, currency).run();
+
+        // Fail-closed safeguard: Verify database persistence succeeded
+        if (d1Result && d1Result.success === false) {
+          throw new Error('Database insertion reported unsuccessful status.');
+        }
       } catch (dbErr) {
-        console.warn('[D1 Order Insert Warning]:', dbErr.message);
+        console.error('[D1 Order Insert Error]: Failed to persist order record:', dbErr.message);
+        return new Response(JSON.stringify({
+          success: false,
+          error: 'Unable to initialize order in database. Checkout aborted for safety.'
+        }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' }
+        });
       }
+    } else if (isProd || isPreview) {
+      console.error('[D1 Order Insert Error]: env.DB is missing in staging/production.');
+      return new Response(JSON.stringify({
+        success: false,
+        error: 'Database service is unavailable. Checkout aborted for safety.'
+      }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
     }
 
     return new Response(JSON.stringify({
