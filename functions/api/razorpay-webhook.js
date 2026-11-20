@@ -1,4 +1,4 @@
-import { processOrderEmail } from './_email.js';
+import { processOrderEmail, classifyEmailEnvironment } from './_email.js';
 
 /**
  * POST /api/razorpay-webhook
@@ -116,17 +116,23 @@ export async function onRequestPost(context) {
         `).bind(paymentId || '', downloadToken, orderId).run();
 
         // Asynchronously dispatch purchase confirmation email with PDF attachment
-        try {
-          const emailPromise = processOrderEmail(orderId, env);
-          if (typeof waitUntil === 'function') {
-            waitUntil(emailPromise);
-          } else if (typeof context !== 'undefined' && context && typeof context.waitUntil === 'function') {
-            context.waitUntil(emailPromise);
-          } else {
-            await emailPromise;
+        // Production environment detection takes precedence; staging/unknown/conflicting environments fail closed
+        const envCheck = classifyEmailEnvironment(env);
+        if (envCheck.shouldSuppressPurchaseDelivery) {
+          console.info(`[Razorpay Webhook]: Staging email suppression active for order ${orderId}. Skipping automatic email dispatch (${envCheck.reason}).`);
+        } else {
+          try {
+            const emailPromise = processOrderEmail(orderId, env);
+            if (typeof waitUntil === 'function') {
+              waitUntil(emailPromise);
+            } else if (typeof context !== 'undefined' && context && typeof context.waitUntil === 'function') {
+              context.waitUntil(emailPromise);
+            } else {
+              await emailPromise;
+            }
+          } catch (emailErr) {
+            console.error('[Webhook Email Dispatch Error]:', emailErr.message);
           }
-        } catch (emailErr) {
-          console.error('[Webhook Email Dispatch Error]:', emailErr.message);
         }
       }
     } else if (eventType === 'payment.failed') {

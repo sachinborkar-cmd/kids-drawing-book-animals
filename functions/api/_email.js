@@ -466,6 +466,86 @@ export function isPositivelyVerifiedPreview(env) {
 }
 
 /**
+ * Classifies the deployment environment for email dispatch safety.
+ *
+ * Requirements:
+ * A. Production precedence:
+ *    - Explicit production (production signals present, zero staging signals) takes precedence over all suppression flags.
+ *    - SUPPRESS_STAGING_EMAILS=true must NEVER suppress production email delivery.
+ * B. Fail-closed:
+ *    - Unknown, missing, or conflicting environment signals must NEVER allow automatic purchase email dispatch.
+ *    - Explicit staging must ALWAYS suppress purchase emails.
+ *    - Explicit production must ALWAYS preserve existing production email behavior.
+ */
+export function classifyEmailEnvironment(env) {
+  if (!env || typeof env !== 'object') {
+    return {
+      isExplicitProd: false,
+      isExplicitStaging: false,
+      isConflicting: false,
+      isUnknown: true,
+      shouldSuppressPurchaseDelivery: true,
+      reason: 'Environment bindings missing (fail-closed)'
+    };
+  }
+
+  const envName = (typeof env.ENVIRONMENT === 'string' ? env.ENVIRONMENT : '').trim().toLowerCase();
+  const nodeEnv = (typeof env.NODE_ENV === 'string' ? env.NODE_ENV : '').trim().toLowerCase();
+  const pagesBranch = (typeof env.CF_PAGES_BRANCH === 'string' ? env.CF_PAGES_BRANCH : '').trim().toLowerCase();
+  const testTargetEnv = (typeof env.TEST_TARGET_ENV === 'string' ? env.TEST_TARGET_ENV : '').trim().toLowerCase();
+
+  const isProdSignal = pagesBranch === 'main' || pagesBranch === 'master' || envName === 'production' || nodeEnv === 'production' || testTargetEnv === 'production';
+  const isStagingSignal = pagesBranch === 'staging' || envName === 'staging' || envName === 'preview' || nodeEnv === 'staging' || testTargetEnv === 'staging';
+
+  // 1. Conflicting signals: Both production and staging signals present -> fail-closed (suppress)
+  if (isProdSignal && isStagingSignal) {
+    return {
+      isExplicitProd: false,
+      isExplicitStaging: false,
+      isConflicting: true,
+      isUnknown: false,
+      shouldSuppressPurchaseDelivery: true,
+      reason: 'Conflicting environment signals detected (fail-closed)'
+    };
+  }
+
+  // 2. Explicit production: Production signal present and zero staging signal
+  if (isProdSignal && !isStagingSignal) {
+    // Production precedence: SUPPRESS_STAGING_EMAILS never suppresses production
+    return {
+      isExplicitProd: true,
+      isExplicitStaging: false,
+      isConflicting: false,
+      isUnknown: false,
+      shouldSuppressPurchaseDelivery: false,
+      reason: 'Explicit production environment'
+    };
+  }
+
+  // 3. Explicit staging: Staging signal present and zero production signal
+  if (isStagingSignal && !isProdSignal) {
+    return {
+      isExplicitProd: false,
+      isExplicitStaging: true,
+      isConflicting: false,
+      isUnknown: false,
+      shouldSuppressPurchaseDelivery: true,
+      reason: 'Explicit staging environment'
+    };
+  }
+
+  // 4. Unknown/missing signals: Neither production nor staging signal present -> fail-closed (suppress)
+  return {
+    isExplicitProd: false,
+    isExplicitStaging: false,
+    isConflicting: false,
+    isUnknown: true,
+    shouldSuppressPurchaseDelivery: true,
+    reason: 'Unknown or missing environment signals (fail-closed)'
+  };
+}
+
+/**
  * Idempotent post-purchase email processor using Cloudflare D1 email_outbox table
  */
 export async function processOrderEmail(orderId, env, options = {}) {
@@ -528,6 +608,22 @@ export async function processOrderEmail(orderId, env, options = {}) {
   if (!order.customer_email || !order.customer_email.includes('@')) {
     console.error(`[Email Outbox]: Invalid customer email for order ${order.id}: ${order.customer_email}`);
     return { success: false, status: 'invalid_email' };
+  }
+
+  // Gate 3: Staging & Non-Production Email Suppression Safeguard
+  // In staging, preview, unknown, or conflicting environments, automatic purchase_delivery email dispatch
+  // is suppressed to guarantee customer safety and prevent unintended email dispatch.
+  // Production environment detection takes precedence over all suppression flags.
+  // customTransport is never permitted to bypass staging suppression for purchase_delivery.
+  const envCheck = classifyEmailEnvironment(env);
+  if (emailType === 'purchase_delivery' && envCheck.shouldSuppressPurchaseDelivery) {
+    console.info(`[Email Outbox]: Staging email suppression active for order ${order.id}. Skipping automatic email dispatch (${envCheck.reason}).`);
+    return {
+      success: true,
+      status: 'staging_suppressed',
+      reason: envCheck.reason,
+      message: `Automatic purchase email dispatch suppressed: ${envCheck.reason}.`
+    };
   }
 
   const outboxId = `out_${order.id}_${emailType}`;

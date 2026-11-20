@@ -30,6 +30,7 @@ import {
 } from '../functions/api/_aws_s3.js';
 import {
   processOrderEmail,
+  classifyEmailEnvironment,
   fetchPdfFromS3,
   renderPurchaseEmail,
   escapeHtml,
@@ -1632,6 +1633,16 @@ await test('The two outbox records (purchase_delivery and staging_compressed_tes
     download_token: dualToken
   });
 
+  const prodTransportEnv = {
+    ...mockEnv,
+    customTransport: mockTransportSuccess,
+    attachmentOverride: {
+      buffer: mockPdfBuffer,
+      filename: 'Kids_Drawing_Book_Animals_School_Edition.pdf',
+      contentType: 'application/pdf'
+    }
+  };
+
   const testEnv = {
     ...previewTestEnv,
     customTransport: mockTransportSuccess,
@@ -1643,7 +1654,7 @@ await test('The two outbox records (purchase_delivery and staging_compressed_tes
   };
 
   // Step 1: Send initial purchase_delivery email (e.g. historical purchase)
-  const res1 = await processOrderEmail(dualOrderId, testEnv, {
+  const res1 = await processOrderEmail(dualOrderId, prodTransportEnv, {
     emailType: 'purchase_delivery'
   });
   assert.equal(res1.success, true);
@@ -2918,6 +2929,11 @@ await test('Payment verification rejects amount mismatch when expecting 100 pais
   assert.equal(verifyRes.status, 400);
   const data = JSON.parse(await verifyRes.text());
   assert(data.error.includes('Payment amount mismatch'));
+  delete globalThis.__mockPaymentId;
+  delete globalThis.__mockPaymentStatus;
+  delete globalThis.__mockPaymentAmount;
+  delete globalThis.__mockPaymentCurrency;
+  delete globalThis.__mockPaymentOrderId;
 });
 
 await test('Existing ₹149 orders remain unaffected and preserve download token under ₹1 price config', async () => {
@@ -3365,6 +3381,424 @@ await test('ViewContent is triggered exclusively on landing page and not on than
     assert(content.includes("fbq('init', '3370053963196277')"), `${file} must preserve fbq('init', '3370053963196277')`);
     assert(content.includes("fbq('track', 'PageView')"), `${file} must preserve fbq('track', 'PageView')`);
   });
+});
+
+await test('Staging payment verification suppresses automatic email dispatch while verifying payment and updating order status', async () => {
+  const stagingOrderId = `ord_staging_email_suppress_${Date.now()}`;
+  const stagingRzpOrderId = `rzp_order_suppress_${Date.now()}`;
+  const stagingRzpPaymentId = `pay_suppress_${Date.now()}`;
+  const testCustomerEmail = 'staging_parent@example.com';
+
+  mockDb.orders.set(stagingOrderId, {
+    id: stagingOrderId,
+    razorpay_order_id: stagingRzpOrderId,
+    customer_name: 'Staging Tester',
+    customer_email: testCustomerEmail,
+    amount: 1,
+    currency: 'INR',
+    status: 'created'
+  });
+
+  const stagingEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'staging',
+    ENVIRONMENT: 'preview',
+    PRODUCT_PRICE: '1',
+    RAZORPAY_KEY_ID: 'rzp_test_TuaqfpTw4hAqFw',
+    RAZORPAY_KEY_SECRET: 'test_secret_suppress'
+  };
+
+  globalThis.__mockPaymentId = stagingRzpPaymentId;
+  globalThis.__mockPaymentOrderId = stagingRzpOrderId;
+  globalThis.__mockPaymentStatus = 'captured';
+  globalThis.__mockPaymentAmount = 100;
+  globalThis.__mockPaymentCurrency = 'INR';
+
+  const sig = await computeWebhookSig(`${stagingRzpOrderId}|${stagingRzpPaymentId}`, stagingEnv.RAZORPAY_KEY_SECRET);
+
+  const req = {
+    json: async () => ({
+      order_id: stagingOrderId,
+      razorpay_order_id: stagingRzpOrderId,
+      razorpay_payment_id: stagingRzpPaymentId,
+      razorpay_signature: sig,
+      email: testCustomerEmail
+    })
+  };
+
+  const res = await handleVerifyPayment({ request: req, env: stagingEnv });
+  delete globalThis.__mockPaymentId;
+  delete globalThis.__mockPaymentOrderId;
+  delete globalThis.__mockPaymentStatus;
+  delete globalThis.__mockPaymentAmount;
+  delete globalThis.__mockPaymentCurrency;
+
+  assert.equal(res.status, 200, 'Payment verification must succeed with HTTP 200');
+  const data = JSON.parse(await res.text());
+  assert.equal(data.success, true, 'Verification must return success: true');
+  assert.equal(data.verified, true, 'Verification must return verified: true');
+  assert(data.download_token, 'Verification must issue a download token');
+
+  // Verify D1 order status was updated to 'paid'
+  const updatedOrder = mockDb.orders.get(stagingOrderId);
+  assert.equal(updatedOrder.status, 'paid', 'D1 order status must be updated to paid');
+  assert.equal(updatedOrder.razorpay_payment_id, stagingRzpPaymentId, 'Payment ID must be persisted');
+
+  // Verify NO email outbox entry was created for purchase_delivery
+  const outboxEntry = mockDb.outbox.get(`${stagingOrderId}_purchase_delivery`);
+  assert(!outboxEntry, 'Staging payment verification must NOT dispatch email (outbox must be empty)');
+});
+
+await test('Staging webhook suppresses automatic email dispatch while marking order paid', async () => {
+  const webhookOrderId = `ord_staging_wh_suppress_${Date.now()}`;
+  const webhookRzpOrderId = `rzp_wh_suppress_${Date.now()}`;
+  const webhookPaymentId = `pay_wh_suppress_${Date.now()}`;
+
+  mockDb.orders.set(webhookRzpOrderId, {
+    id: webhookOrderId,
+    razorpay_order_id: webhookRzpOrderId,
+    customer_name: 'Webhook Tester',
+    customer_email: 'webhook_tester@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'created'
+  });
+
+  const stagingEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'staging',
+    ENVIRONMENT: 'preview',
+    PRODUCT_PRICE: '1',
+    RAZORPAY_WEBHOOK_SECRET: 'webhook_secret_suppress'
+  };
+
+  const payload = JSON.stringify({
+    event: 'payment.captured',
+    event_id: `evt_suppress_${Date.now()}`,
+    payload: {
+      payment: {
+        entity: {
+          id: webhookPaymentId,
+          order_id: webhookRzpOrderId
+        }
+      }
+    }
+  });
+
+  const sig = await computeWebhookSig(payload, stagingEnv.RAZORPAY_WEBHOOK_SECRET);
+
+  const res = await handleWebhook({
+    request: {
+      text: async () => payload,
+      headers: { get: (h) => (h.toLowerCase() === 'x-razorpay-signature' ? sig : null) }
+    },
+    env: stagingEnv
+  });
+
+  assert.equal(res.status, 200, 'Webhook must return HTTP 200');
+  const data = JSON.parse(await res.text());
+  assert.equal(data.status, 'success', 'Webhook must return status: success');
+
+  // Verify D1 order status was updated to 'paid'
+  const updatedOrder = mockDb.orders.get(webhookRzpOrderId);
+  assert.equal(updatedOrder.status, 'paid', 'D1 order status must be updated to paid');
+
+  // Verify NO email outbox entry was created
+  const outboxEntry = mockDb.outbox.get(`${webhookOrderId}_purchase_delivery`);
+  assert(!outboxEntry, 'Staging webhook must NOT dispatch email (outbox must be empty)');
+});
+
+await test('processOrderEmail directly enforces Gate 3 staging email suppression for purchase_delivery', async () => {
+  const directOrderId = `ord_direct_suppress_${Date.now()}`;
+  mockDb.orders.set(directOrderId, {
+    id: directOrderId,
+    razorpay_order_id: `rzp_direct_${Date.now()}`,
+    customer_name: 'Direct Tester',
+    customer_email: 'direct_tester@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid'
+  });
+
+  const stagingEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'staging',
+    ENVIRONMENT: 'preview'
+  };
+
+  const res = await processOrderEmail(directOrderId, stagingEnv);
+  assert.equal(res.success, true, 'Suppressed call returns success: true');
+  assert.equal(res.status, 'staging_suppressed', 'Status must be staging_suppressed');
+  const outboxEntry = mockDb.outbox.get(`${directOrderId}_purchase_delivery`);
+  assert(!outboxEntry, 'No outbox record should exist when staging suppression is active');
+});
+
+await test('Production email dispatch remains completely active and unsuppressed', async () => {
+  const prodOrderId = `ord_prod_email_active_${Date.now()}`;
+  mockDb.orders.set(prodOrderId, {
+    id: prodOrderId,
+    razorpay_order_id: `rzp_prod_${Date.now()}`,
+    customer_name: 'Real Customer',
+    customer_email: 'customer@example.com',
+    amount: 149,
+    currency: 'INR',
+    status: 'paid'
+  });
+
+  // Production environment configuration
+  const prodEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'main',
+    ENVIRONMENT: 'production',
+    PRODUCT_PRICE: '149'
+  };
+
+  let mockSent = false;
+  let sentOptions = null;
+  const res = await processOrderEmail(prodOrderId, prodEnv, {
+    attachmentOverride: {
+      buffer: mockPdfBuffer,
+      filename: 'Kids_Drawing_Book_Animals_School_Edition.pdf',
+      contentType: 'application/pdf',
+      size: mockPdfBuffer.length
+    },
+    customTransport: async (mailOptions) => {
+      mockSent = true;
+      sentOptions = mailOptions;
+      return { success: true, messageId: '<prod-msg-123@smtp.gmail.com>' };
+    }
+  });
+
+  assert.equal(res.success, true, 'Production email processing must succeed');
+  assert.equal(res.status, 'sent', 'Production email status must be sent');
+  assert.equal(mockSent, true, 'Production transport send must be called');
+  assert.equal(sentOptions?.to, 'customer@example.com', 'Recipient email must match');
+  const outbox = mockDb.outbox.get(`${prodOrderId}_purchase_delivery`);
+  assert(outbox, 'Outbox record must exist in production');
+  assert.equal(outbox.status, 'sent', 'Outbox status must be sent');
+});
+
+await test('classifyEmailEnvironment correctly classifies environments and enforces production precedence', async () => {
+  // 1. Explicit production
+  const prodRes = classifyEmailEnvironment({ CF_PAGES_BRANCH: 'main', ENVIRONMENT: 'production' });
+  assert.equal(prodRes.isExplicitProd, true);
+  assert.equal(prodRes.shouldSuppressPurchaseDelivery, false);
+
+  // 2. Production with SUPPRESS_STAGING_EMAILS=true (Precedence check)
+  const prodSuppressedFlagRes = classifyEmailEnvironment({
+    CF_PAGES_BRANCH: 'main',
+    ENVIRONMENT: 'production',
+    SUPPRESS_STAGING_EMAILS: 'true'
+  });
+  assert.equal(prodSuppressedFlagRes.isExplicitProd, true, 'Production precedence must hold');
+  assert.equal(prodSuppressedFlagRes.shouldSuppressPurchaseDelivery, false, 'SUPPRESS_STAGING_EMAILS must never suppress production');
+
+  // 3. Explicit staging
+  const stagingRes = classifyEmailEnvironment({ CF_PAGES_BRANCH: 'staging', ENVIRONMENT: 'preview' });
+  assert.equal(stagingRes.isExplicitStaging, true);
+  assert.equal(stagingRes.shouldSuppressPurchaseDelivery, true);
+
+  // 4. Conflicting environment signals
+  const conflictRes = classifyEmailEnvironment({ CF_PAGES_BRANCH: 'staging', ENVIRONMENT: 'production' });
+  assert.equal(conflictRes.isConflicting, true);
+  assert.equal(conflictRes.isExplicitProd, false);
+  assert.equal(conflictRes.shouldSuppressPurchaseDelivery, true);
+
+  // 5. Missing / unknown environment signals
+  const missingRes = classifyEmailEnvironment({});
+  assert.equal(missingRes.isUnknown, true);
+  assert.equal(missingRes.isExplicitProd, false);
+  assert.equal(missingRes.shouldSuppressPurchaseDelivery, true);
+
+  // 6. Null / non-object environment
+  const nullRes = classifyEmailEnvironment(null);
+  assert.equal(nullRes.isUnknown, true);
+  assert.equal(nullRes.shouldSuppressPurchaseDelivery, true);
+});
+
+await test('Production email remains active and unsuppressed even when SUPPRESS_STAGING_EMAILS=true (Production Precedence)', async () => {
+  const precedenceOrderId = `ord_prod_precedence_${Date.now()}`;
+  mockDb.orders.set(precedenceOrderId, {
+    id: precedenceOrderId,
+    razorpay_order_id: `rzp_prod_precedence_${Date.now()}`,
+    customer_name: 'Precedence Customer',
+    customer_email: 'precedence@example.com',
+    amount: 149,
+    currency: 'INR',
+    status: 'paid'
+  });
+
+  const prodEnvWithSuppression = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'main',
+    ENVIRONMENT: 'production',
+    PRODUCT_PRICE: '149',
+    SUPPRESS_STAGING_EMAILS: 'true'
+  };
+
+  let mockSent = false;
+  const res = await processOrderEmail(precedenceOrderId, prodEnvWithSuppression, {
+    attachmentOverride: {
+      buffer: mockPdfBuffer,
+      filename: 'Kids_Drawing_Book_Animals_School_Edition.pdf',
+      contentType: 'application/pdf',
+      size: mockPdfBuffer.length
+    },
+    customTransport: async () => {
+      mockSent = true;
+      return { success: true, messageId: '<prod-precedence-msg@smtp.gmail.com>' };
+    }
+  });
+
+  assert.equal(res.success, true, 'Production email processing must succeed');
+  assert.equal(res.status, 'sent', 'Production email status must be sent');
+  assert.equal(mockSent, true, 'Production transport send must be called even when SUPPRESS_STAGING_EMAILS=true');
+  const outbox = mockDb.outbox.get(`${precedenceOrderId}_purchase_delivery`);
+  assert(outbox, 'Outbox record must exist in production');
+  assert.equal(outbox.status, 'sent');
+});
+
+await test('Missing or empty environment signals fail closed and suppress purchase email dispatch', async () => {
+  const missingEnvOrderId = `ord_missing_env_${Date.now()}`;
+  mockDb.orders.set(missingEnvOrderId, {
+    id: missingEnvOrderId,
+    razorpay_order_id: `rzp_missing_env_${Date.now()}`,
+    customer_name: 'Missing Env Customer',
+    customer_email: 'missing_env@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid'
+  });
+
+  const missingEnv = {
+    DB: mockDb
+  };
+
+  const res = await processOrderEmail(missingEnvOrderId, missingEnv);
+  assert.equal(res.success, true);
+  assert.equal(res.status, 'staging_suppressed', 'Missing environment must fail closed and suppress email');
+  assert(res.reason.includes('fail-closed'), 'Reason must indicate fail-closed behavior');
+  const outbox = mockDb.outbox.get(`${missingEnvOrderId}_purchase_delivery`);
+  assert(!outbox, 'No outbox record must exist for missing environment');
+});
+
+await test('Conflicting environment signals fail closed and suppress purchase email dispatch', async () => {
+  const conflictOrderId = `ord_conflict_env_${Date.now()}`;
+  mockDb.orders.set(conflictOrderId, {
+    id: conflictOrderId,
+    razorpay_order_id: `rzp_conflict_env_${Date.now()}`,
+    customer_name: 'Conflict Customer',
+    customer_email: 'conflict@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid'
+  });
+
+  const conflictingEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'staging',
+    ENVIRONMENT: 'production'
+  };
+
+  const res = await processOrderEmail(conflictOrderId, conflictingEnv);
+  assert.equal(res.success, true);
+  assert.equal(res.status, 'staging_suppressed', 'Conflicting environment must fail closed and suppress email');
+  assert(res.reason.includes('Conflicting'), 'Reason must indicate conflicting signals');
+  const outbox = mockDb.outbox.get(`${conflictOrderId}_purchase_delivery`);
+  assert(!outbox, 'No outbox record must exist for conflicting environment');
+});
+
+await test('customTransport in staging cannot bypass staging email suppression for purchase_delivery', async () => {
+  const bypassAttemptOrderId = `ord_bypass_attempt_${Date.now()}`;
+  mockDb.orders.set(bypassAttemptOrderId, {
+    id: bypassAttemptOrderId,
+    razorpay_order_id: `rzp_bypass_${Date.now()}`,
+    customer_name: 'Bypass Tester',
+    customer_email: 'bypass@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid'
+  });
+
+  const stagingEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'staging',
+    ENVIRONMENT: 'preview'
+  };
+
+  let transportCalled = false;
+  const res = await processOrderEmail(bypassAttemptOrderId, stagingEnv, {
+    emailType: 'purchase_delivery',
+    customTransport: async () => {
+      transportCalled = true;
+      return { success: true };
+    }
+  });
+
+  assert.equal(res.success, true);
+  assert.equal(res.status, 'staging_suppressed', 'customTransport must NOT bypass staging suppression');
+  assert.equal(transportCalled, false, 'customTransport must NOT be called in staging for purchase_delivery');
+  const outbox = mockDb.outbox.get(`${bypassAttemptOrderId}_purchase_delivery`);
+  assert(!outbox, 'No outbox record must be created when suppressed in staging');
+});
+
+await test('Payment verification in conflicting environment marks order paid in D1 while suppressing email', async () => {
+  const conflictOrderId = `ord_verify_conflict_${Date.now()}`;
+  const conflictRzpId = `rzp_verify_conflict_${Date.now()}`;
+  const conflictPayId = `pay_verify_conflict_${Date.now()}`;
+
+  mockDb.orders.set(conflictOrderId, {
+    id: conflictOrderId,
+    razorpay_order_id: conflictRzpId,
+    customer_name: 'Conflict Verifier',
+    customer_email: 'conflict_verify@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'created'
+  });
+
+  const conflictingEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'staging',
+    ENVIRONMENT: 'production',
+    PRODUCT_PRICE: '1',
+    RAZORPAY_KEY_SECRET: 'test_sec_conflict'
+  };
+
+  globalThis.__mockPaymentId = conflictPayId;
+  globalThis.__mockPaymentOrderId = conflictRzpId;
+  globalThis.__mockPaymentStatus = 'captured';
+  globalThis.__mockPaymentAmount = 100;
+  globalThis.__mockPaymentCurrency = 'INR';
+
+  const sig = await computeWebhookSig(`${conflictRzpId}|${conflictPayId}`, conflictingEnv.RAZORPAY_KEY_SECRET);
+
+  const res = await handleVerifyPayment({
+    request: {
+      json: async () => ({
+        order_id: conflictOrderId,
+        razorpay_order_id: conflictRzpId,
+        razorpay_payment_id: conflictPayId,
+        razorpay_signature: sig,
+        email: 'conflict_verify@example.com'
+      })
+    },
+    env: conflictingEnv
+  });
+
+  delete globalThis.__mockPaymentId;
+  delete globalThis.__mockPaymentOrderId;
+  delete globalThis.__mockPaymentStatus;
+  delete globalThis.__mockPaymentAmount;
+  delete globalThis.__mockPaymentCurrency;
+
+  assert.equal(res.status, 200, 'Payment verification succeeds despite conflicting email environment');
+  const data = JSON.parse(await res.text());
+  assert.equal(data.success, true);
+  assert.equal(data.verified, true);
+  assert.equal(mockDb.orders.get(conflictOrderId).status, 'paid', 'D1 order status must be paid');
+  const outbox = mockDb.outbox.get(`${conflictOrderId}_purchase_delivery`);
+  assert(!outbox, 'Conflicting environment must NOT dispatch email');
 });
 
 console.log('\n======================================================');

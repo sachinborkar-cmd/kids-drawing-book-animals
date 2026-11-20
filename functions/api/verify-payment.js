@@ -1,5 +1,5 @@
 import { verifyRazorpaySignature } from './_aws_s3.js';
-import { processOrderEmail } from './_email.js';
+import { processOrderEmail, classifyEmailEnvironment } from './_email.js';
 
 /**
  * POST /api/verify-payment
@@ -293,14 +293,20 @@ export async function onRequestPost(context) {
         `).bind(razorpay_payment_id, razorpay_signature || '', downloadToken, razorpay_order_id, targetOrderId).run();
 
         // Asynchronously dispatch purchase confirmation email with PDF attachment
-        const emailPromise = processOrderEmail(targetOrderId, env);
-        if (typeof waitUntil === 'function') {
-          waitUntil(emailPromise);
-        } else if (typeof context !== 'undefined' && context && typeof context.waitUntil === 'function') {
-          context.waitUntil(emailPromise);
+        // Production environment detection takes precedence; staging/unknown/conflicting environments fail closed
+        const envCheck = classifyEmailEnvironment(env);
+        if (envCheck.shouldSuppressPurchaseDelivery) {
+          console.info(`[Payment Verify]: Staging email suppression active for order ${targetOrderId}. Skipping automatic email dispatch (${envCheck.reason}).`);
         } else {
-          // Await in local test runners where waitUntil is not provided
-          await emailPromise;
+          const emailPromise = processOrderEmail(targetOrderId, env);
+          if (typeof waitUntil === 'function') {
+            waitUntil(emailPromise);
+          } else if (typeof context !== 'undefined' && context && typeof context.waitUntil === 'function') {
+            context.waitUntil(emailPromise);
+          } else {
+            // Await in local test runners where waitUntil is not provided
+            await emailPromise;
+          }
         }
       } catch (dbErr) {
         console.error('[D1 Verify Update Error]:', dbErr);
