@@ -102,6 +102,18 @@ export async function onRequestPost(context) {
 
     if (eventType === 'payment.captured' || eventType === 'order.paid') {
       if (orderId && env.DB) {
+        // Extract verified payment capture timestamp
+        let capturedIso = null;
+        const rawCapturedAt = paymentEntity?.created_at || event.payload?.order?.entity?.created_at || event.created_at;
+        if (typeof rawCapturedAt === 'number' && rawCapturedAt > 0) {
+          capturedIso = new Date(rawCapturedAt * 1000).toISOString();
+        } else if (rawCapturedAt) {
+          const parsed = Number(rawCapturedAt);
+          if (!Number.isNaN(parsed) && parsed > 0) {
+            capturedIso = new Date(parsed * 1000).toISOString();
+          }
+        }
+
         // Ensure order is marked paid and has a download token
         const tokenBytes = new Uint8Array(24);
         crypto.getRandomValues(tokenBytes);
@@ -112,9 +124,10 @@ export async function onRequestPost(context) {
           SET status = 'paid',
               razorpay_payment_id = COALESCE(razorpay_payment_id, ?),
               download_token = COALESCE(download_token, ?),
+              paid_at = COALESCE(paid_at, ?),
               updated_at = datetime('now')
           WHERE razorpay_order_id = ?
-        `).bind(paymentId || '', downloadToken, orderId).run();
+        `).bind(paymentId || '', downloadToken, capturedIso, orderId).run();
 
         // Asynchronously dispatch purchase confirmation email with PDF attachment
         // Production environment detection takes precedence; staging/unknown/conflicting environments fail closed
@@ -142,6 +155,8 @@ export async function onRequestPost(context) {
             clientIp: request.headers?.get ? request.headers.get('cf-connecting-ip') : null,
             userAgent: request.headers?.get ? request.headers.get('user-agent') : null,
             sourceUrl: `https://${(request.headers?.get ? request.headers.get('host') : null) || 'ebooks.trenzy.store'}/thank-you/?order_id=${encodeURIComponent(orderId)}`,
+            paidAt: capturedIso,
+            paymentCreatedAt: rawCapturedAt,
             customFetch: env.customFetch
           };
           const capiPromise = sendCapiPurchaseEvent(orderId, env, capiContext);

@@ -42,11 +42,13 @@ import {
 import {
   sendCapiPurchaseEvent,
   buildCapiPurchasePayload,
+  parseUtcToUnixSeconds,
   sha256Hex,
   hashPhone,
   hashCustomerNames,
   sanitizeErrorMessage,
-  META_PIXEL_ID_DEFAULT
+  META_PIXEL_ID_DEFAULT,
+  META_GRAPH_API_VERSION_DEFAULT
 } from '../functions/api/_meta_capi.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -87,7 +89,8 @@ class MockD1 {
               currency,
               status: status || 'created',
               download_token: null,
-              download_count: 0
+              download_count: 0,
+              paid_at: null
             });
             return { success: true };
           }
@@ -102,6 +105,29 @@ class MockD1 {
               }
               return { success: true };
             }
+            if (args.length === 4) {
+              const [payment_id, token, paid_at, rzp_order_id] = args;
+              const rec = this.orders.get(rzp_order_id) || Array.from(this.orders.values()).find(o => o.id === rzp_order_id);
+              if (rec) {
+                rec.status = 'paid';
+                rec.razorpay_payment_id = rec.razorpay_payment_id || payment_id;
+                rec.download_token = rec.download_token || token;
+                rec.paid_at = rec.paid_at || paid_at;
+              }
+              return { success: true };
+            }
+            if (args.length === 6) {
+              const [payment_id, signature, token, paid_at, rzp_order_id, targetOrderId] = args;
+              const rec = this.orders.get(rzp_order_id) || Array.from(this.orders.values()).find(o => o.id === rzp_order_id || o.id === targetOrderId);
+              if (rec) {
+                rec.status = 'paid';
+                rec.razorpay_payment_id = payment_id;
+                rec.razorpay_signature = signature;
+                rec.download_token = token;
+                rec.paid_at = rec.paid_at || paid_at;
+              }
+              return { success: true };
+            }
             const [payment_id, signature, token, rzp_order_id, targetOrderId] = args;
             const rec = this.orders.get(rzp_order_id) || Array.from(this.orders.values()).find(o => o.id === rzp_order_id || o.id === targetOrderId);
             if (rec) {
@@ -110,6 +136,9 @@ class MockD1 {
               rec.razorpay_signature = signature;
               rec.download_token = token;
             }
+            return { success: true };
+          }
+          if (q.startsWith('ALTER TABLE orders ADD COLUMN paid_at')) {
             return { success: true };
           }
           if (q.startsWith('UPDATE orders') && q.includes("status = 'failed'")) {
@@ -375,7 +404,8 @@ globalThis.fetch = async (url, options = {}) => {
         amount: amount,
         currency: currency,
         status: status,
-        order_id: orderId
+        order_id: orderId,
+        created_at: globalThis.__mockPaymentCreatedAt !== undefined ? globalThis.__mockPaymentCreatedAt : 1732103456
       })
     };
   }
@@ -3936,7 +3966,8 @@ await test('Valid paid order creates a CAPI Purchase event', async () => {
     customer_phone: '9876543210',
     amount: 1,
     currency: 'INR',
-    status: 'paid'
+    status: 'paid',
+    paid_at: '2026-11-20T12:00:00.000Z'
   });
 
   globalThis.__lastMetaCapiCall = null;
@@ -3955,11 +3986,14 @@ await test('Valid paid order creates a CAPI Purchase event', async () => {
   assert(globalThis.__lastMetaCapiCall, 'Meta Graph API must have been called');
   assert(globalThis.__lastMetaCapiCall.url.includes('/events'), 'Must POST to /events');
   assert(globalThis.__lastMetaCapiCall.url.includes(META_PIXEL_ID_DEFAULT), 'Must target Pixel ID');
+  assert(globalThis.__lastMetaCapiCall.url.includes('/v26.0/'), 'Must use Graph API v26.0');
   const payload = globalThis.__lastMetaCapiCall.body;
   assert(Array.isArray(payload.data) && payload.data.length === 1);
   const ev = payload.data[0];
   assert.equal(ev.event_name, 'Purchase');
   assert.equal(ev.event_id, orderId, 'event_id must exactly match stable order ID');
+  const expectedEventTime = parseUtcToUnixSeconds('2026-11-20T12:00:00.000Z');
+  assert.equal(ev.event_time, expectedEventTime, 'event_time must match paid_at in Unix seconds');
   assert.equal(ev.action_source, 'website');
   assert.equal(ev.custom_data.value, 1);
   assert.equal(ev.custom_data.currency, 'INR');
@@ -4067,7 +4101,8 @@ await test('Missing CAPI token fails safely', async () => {
     customer_email: 'notoken@example.com',
     amount: 1,
     currency: 'INR',
-    status: 'paid'
+    status: 'paid',
+    paid_at: '2026-11-20T12:00:00.000Z'
   });
 
   const envWithoutToken = { ...mockEnv, META_CAPI_ACCESS_TOKEN: '' };
@@ -4105,7 +4140,8 @@ await test('Duplicate webhook delivery does not create duplicate events', async 
           order_id: rzpOrderId,
           status: 'captured',
           amount: 14900,
-          currency: 'INR'
+          currency: 'INR',
+          created_at: 1732103456
         }
       }
     }
@@ -4211,7 +4247,8 @@ await test('Concurrent webhook and verification requests are idempotent', async 
     customer_email: 'concurrent@example.com',
     amount: 149,
     currency: 'INR',
-    status: 'paid'
+    status: 'paid',
+    paid_at: '2026-11-20T12:00:00.000Z'
   });
 
   globalThis.__metaCapiCallCount = 0;
@@ -4234,7 +4271,8 @@ await test('Meta API failure is recorded safely and can be retried without creat
     customer_email: 'retry@example.com',
     amount: 1,
     currency: 'INR',
-    status: 'paid'
+    status: 'paid',
+    paid_at: '2026-11-20T12:00:00.000Z'
   });
 
   globalThis.__mockMetaApiError = true;
@@ -4271,7 +4309,8 @@ await test('Token is never exposed in logs or responses', async () => {
     customer_email: 'leakcheck@example.com',
     amount: 1,
     currency: 'INR',
-    status: 'paid'
+    status: 'paid',
+    paid_at: '2026-11-20T12:00:00.000Z'
   });
 
   globalThis.__mockMetaApiError = true;
@@ -4363,6 +4402,185 @@ await test('Existing browser Pixel events remain unchanged', async () => {
   assert(thankYouJs.includes("window.Analytics.trackPurchase"), 'thank-you.js must invoke Analytics.trackPurchase on verified order');
   assert(landingJs.includes("Analytics.trackViewContent"), 'landing.js must invoke trackViewContent');
   assert(checkoutJs.includes("Analytics.trackInitiateCheckout"), 'checkout.js must invoke trackInitiateCheckout');
+});
+
+await test('parseUtcToUnixSeconds parses various formats deterministically with explicit UTC', async () => {
+  // Epoch seconds
+  assert.equal(parseUtcToUnixSeconds(1732103456), 1732103456);
+  assert.equal(parseUtcToUnixSeconds('1732103456'), 1732103456);
+
+  // Epoch milliseconds
+  assert.equal(parseUtcToUnixSeconds(1732103456000), 1732103456);
+  assert.equal(parseUtcToUnixSeconds('1732103456000'), 1732103456);
+
+  // ISO string with UTC Z
+  const expectedUtcSeconds = Math.floor(new Date('2026-11-20T12:00:00.000Z').getTime() / 1000);
+  assert.equal(parseUtcToUnixSeconds('2026-11-20T12:00:00.000Z'), expectedUtcSeconds);
+
+  // SQLite datetime space-separated format (YYYY-MM-DD HH:MM:SS) must be parsed explicitly as UTC
+  assert.equal(parseUtcToUnixSeconds('2026-11-20 12:00:00'), expectedUtcSeconds);
+
+  // Non-positive, missing, empty, or invalid values return null
+  assert.equal(parseUtcToUnixSeconds(null), null);
+  assert.equal(parseUtcToUnixSeconds(''), null);
+  assert.equal(parseUtcToUnixSeconds('   '), null);
+  assert.equal(parseUtcToUnixSeconds(0), null);
+  assert.equal(parseUtcToUnixSeconds(-100), null);
+  assert.equal(parseUtcToUnixSeconds('not-a-date'), null);
+});
+
+await test('Order missing paid_at fails safely with missing_paid_at and does not fabricate event_time', async () => {
+  const orderId = `ord_no_paid_at_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: `rzp_no_paid_at_${Date.now()}`,
+    customer_email: 'nopaidat@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid',
+    paid_at: null
+  });
+
+  globalThis.__lastMetaCapiCall = null;
+  const res = await sendCapiPurchaseEvent(orderId, mockEnv);
+  assert.equal(res.success, false);
+  assert.equal(res.status, 'missing_paid_at');
+  assert(res.error.includes('missing a valid payment capture timestamp'));
+  assert.equal(globalThis.__lastMetaCapiCall, null, 'Must NOT fabricate event_time or call Meta API');
+});
+
+await test('CAPI Purchase event preserves canonical paid_at timestamp across retries (never uses Date.now)', async () => {
+  const orderId = `ord_canonical_paid_at_${Date.now()}`;
+  const canonicalPaidAt = '2026-11-20T10:15:30.000Z';
+  const expectedUnixSeconds = Math.floor(new Date(canonicalPaidAt).getTime() / 1000);
+
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: `rzp_canonical_${Date.now()}`,
+    customer_email: 'canonical@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid',
+    paid_at: canonicalPaidAt
+  });
+
+  // First attempt fails at Meta API
+  globalThis.__mockMetaApiError = true;
+  const failRes = await sendCapiPurchaseEvent(orderId, mockEnv);
+  assert.equal(failRes.status, 'meta_api_error');
+  delete globalThis.__mockMetaApiError;
+
+  // Retry attempt succeeds
+  globalThis.__lastMetaCapiCall = null;
+  const retryRes = await sendCapiPurchaseEvent(orderId, mockEnv);
+  assert.equal(retryRes.status, 'sent');
+  assert(globalThis.__lastMetaCapiCall, 'Meta API must be called');
+  const ev = globalThis.__lastMetaCapiCall.body.data[0];
+  assert.equal(ev.event_time, expectedUnixSeconds, 'event_time must strictly match original paid_at, not retry time');
+});
+
+await test('verify-payment and webhook payment capture paths preserve paid_at using COALESCE without overwriting', async () => {
+  const orderId = `ord_coalesce_${Date.now()}`;
+  const rzpOrderId = `order_coalesce_${Date.now()}`;
+  const rzpPaymentId = `pay_coalesce_${Date.now()}`;
+  const initialCapturedEpoch = 1732103000;
+  const initialIso = new Date(initialCapturedEpoch * 1000).toISOString();
+
+  // Create initial order
+  mockDb.orders.set(rzpOrderId, {
+    id: orderId,
+    razorpay_order_id: rzpOrderId,
+    customer_email: 'coalesce@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'created',
+    paid_at: null
+  });
+
+  // 1. Webhook delivers payment first with initialCapturedEpoch
+  const eventPayload = {
+    event: 'payment.captured',
+    event_id: `evt_coalesce_${Date.now()}`,
+    payload: {
+      payment: {
+        entity: {
+          id: rzpPaymentId,
+          order_id: rzpOrderId,
+          status: 'captured',
+          amount: 100,
+          currency: 'INR',
+          created_at: initialCapturedEpoch
+        }
+      }
+    }
+  };
+  const rawBody = JSON.stringify(eventPayload);
+  const sig = await computeWebhookSig(rawBody, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+
+  const whRes = await handleWebhook({
+    request: {
+      headers: new Headers({ 'x-razorpay-signature': sig }),
+      text: async () => rawBody
+    },
+    env: mockEnv
+  });
+  assert.equal(whRes.status, 200);
+
+  const storedOrder = mockDb.orders.get(rzpOrderId);
+  assert.equal(storedOrder.status, 'paid');
+  assert.equal(storedOrder.paid_at, initialIso, 'Webhook must set canonical paid_at');
+
+  // 2. verify-payment runs later with a different paymentData.created_at
+  globalThis.__mockPaymentId = rzpPaymentId;
+  globalThis.__mockPaymentOrderId = rzpOrderId;
+  globalThis.__mockPaymentStatus = 'captured';
+  globalThis.__mockPaymentAmount = 100;
+  globalThis.__mockPaymentCurrency = 'INR';
+  globalThis.__mockPaymentCreatedAt = 1732109999; // Different epoch
+
+  const verifySig = await computeWebhookSig(`${rzpOrderId}|${rzpPaymentId}`, mockEnv.RAZORPAY_KEY_SECRET);
+  const verifyRes = await handleVerifyPayment({
+    request: {
+      headers: new Headers({ 'cf-connecting-ip': '1.2.3.4' }),
+      json: async () => ({
+        order_id: orderId,
+        razorpay_order_id: rzpOrderId,
+        razorpay_payment_id: rzpPaymentId,
+        razorpay_signature: verifySig
+      })
+    },
+    env: mockEnv
+  });
+
+  delete globalThis.__mockPaymentId;
+  delete globalThis.__mockPaymentOrderId;
+  delete globalThis.__mockPaymentStatus;
+  delete globalThis.__mockPaymentAmount;
+  delete globalThis.__mockPaymentCurrency;
+  delete globalThis.__mockPaymentCreatedAt;
+
+  assert.equal(verifyRes.status, 200);
+  assert.equal(storedOrder.paid_at, initialIso, 'COALESCE must preserve original paid_at and never overwrite it');
+});
+
+await test('Meta CAPI endpoint uses Graph API v26.0 by default', async () => {
+  assert.equal(META_GRAPH_API_VERSION_DEFAULT, 'v26.0', 'Default Graph API version must be v26.0');
+
+  const orderId = `ord_capi_v26_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: `rzp_v26_${Date.now()}`,
+    customer_email: 'v26@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid',
+    paid_at: '2026-11-20T12:00:00.000Z'
+  });
+
+  globalThis.__lastMetaCapiCall = null;
+  const res = await sendCapiPurchaseEvent(orderId, mockEnv);
+  assert.equal(res.success, true);
+  assert(globalThis.__lastMetaCapiCall.url.startsWith('https://graph.facebook.com/v26.0/'), 'URL must start with https://graph.facebook.com/v26.0/');
 });
 
 console.log('\n======================================================');

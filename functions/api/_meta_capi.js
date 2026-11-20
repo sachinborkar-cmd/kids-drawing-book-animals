@@ -9,7 +9,53 @@
  */
 
 export const META_PIXEL_ID_DEFAULT = '3370053963196277';
-export const META_GRAPH_API_VERSION_DEFAULT = 'v21.0';
+export const META_GRAPH_API_VERSION_DEFAULT = 'v26.0';
+
+/**
+ * Deterministically parses a timestamp into Unix epoch seconds with explicit UTC handling.
+ * Accepts:
+ * - integer or float Unix seconds (e.g. 1732103456)
+ * - integer Unix milliseconds (e.g. 1732103456000)
+ * - ISO-8601 strings (e.g. '2026-11-20T12:00:00.000Z')
+ * - SQLite datetime strings (e.g. '2026-11-20 12:00:00') - explicitly treated as UTC ('Z')
+ * Returns null if missing, invalid, or non-positive.
+ */
+export function parseUtcToUnixSeconds(val) {
+  if (val === null || val === undefined || val === '') return null;
+  if (typeof val === 'number') {
+    if (val > 1e11) {
+      return Math.floor(val / 1000);
+    }
+    if (val > 0) {
+      return Math.floor(val);
+    }
+    return null;
+  }
+  if (typeof val === 'string') {
+    const trimmed = val.trim();
+    if (!trimmed) return null;
+    // Check if numeric string
+    if (/^\d+$/.test(trimmed)) {
+      const num = Number(trimmed);
+      if (num > 1e11) return Math.floor(num / 1000);
+      if (num > 0) return Math.floor(num);
+      return null;
+    }
+    // Handle SQLite datetime 'YYYY-MM-DD HH:MM:SS' or ISO strings
+    let candidate = trimmed;
+    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(candidate)) {
+      candidate = candidate.replace(' ', 'T');
+    }
+    if (!candidate.endsWith('Z') && !/[+-]\d{2}:?\d{2}$/.test(candidate)) {
+      candidate += 'Z';
+    }
+    const ms = Date.parse(candidate);
+    if (!Number.isNaN(ms) && ms > 0) {
+      return Math.floor(ms / 1000);
+    }
+  }
+  return null;
+}
 
 /**
  * Standard SHA-256 hex hasher using Web Crypto API
@@ -104,13 +150,11 @@ export async function buildCapiPurchasePayload(order, env, requestContext = {}) 
     order_id: order.id
   };
 
-  // 3. Event Time (Unix epoch seconds)
-  let eventTime = Math.floor(Date.now() / 1000);
-  if (order.created_at) {
-    const parsed = Math.floor(new Date(order.created_at).getTime() / 1000);
-    if (!Number.isNaN(parsed) && parsed > 0) {
-      eventTime = parsed;
-    }
+  // 3. Event Time (Unix epoch seconds from verified payment capture timestamp)
+  const rawPaidAt = order.paid_at || requestContext.paidAt || requestContext.paymentCreatedAt;
+  const eventTime = parseUtcToUnixSeconds(rawPaidAt);
+  if (!eventTime) {
+    throw new Error(`Order ${order.id} is missing a valid payment capture timestamp (paid_at)`);
   }
 
   // 4. Source URL
@@ -165,6 +209,11 @@ export async function ensureCapiEventsTable(db) {
   } catch (err) {
     // Non-fatal if table already exists or permission restricted
   }
+  try {
+    await db.prepare(`ALTER TABLE orders ADD COLUMN paid_at TEXT;`).run();
+  } catch (err) {
+    // Column already exists or permission restricted - non-fatal
+  }
 }
 
 /**
@@ -184,7 +233,7 @@ export function sanitizeErrorMessage(err) {
  * 
  * @param {string} orderId - Stored order ID (e.g. ord_UUID) or razorpay_order_id
  * @param {object} env - Cloudflare environment bindings
- * @param {object} requestContext - Context metadata (clientIp, userAgent, sourceUrl, customFetch)
+ * @param {object} requestContext - Context metadata (clientIp, userAgent, sourceUrl, customFetch, paidAt, paymentCreatedAt)
  * @returns {Promise<object>} Result status object
  */
 export async function sendCapiPurchaseEvent(orderId, env, requestContext = {}) {
@@ -205,7 +254,7 @@ export async function sendCapiPurchaseEvent(orderId, env, requestContext = {}) {
   let order;
   try {
     order = await env.DB.prepare(`
-      SELECT id, razorpay_order_id, razorpay_payment_id, customer_name, customer_email, customer_phone, amount, currency, status, created_at
+      SELECT id, razorpay_order_id, razorpay_payment_id, customer_name, customer_email, customer_phone, amount, currency, status, created_at, paid_at
       FROM orders
       WHERE id = ? OR razorpay_order_id = ?
     `).bind(cleanOrderId, cleanOrderId).first();
@@ -242,6 +291,17 @@ export async function sendCapiPurchaseEvent(orderId, env, requestContext = {}) {
       success: false,
       status: 'invalid_currency',
       error: `Order ${order.id} currency '${order.currency}' does not match expected '${expectedCurrency}'`
+    };
+  }
+
+  // 5. Validate verified payment capture timestamp (paid_at)
+  const rawPaidAt = order.paid_at || requestContext.paidAt || requestContext.paymentCreatedAt;
+  const verifiedEventTime = parseUtcToUnixSeconds(rawPaidAt);
+  if (!verifiedEventTime) {
+    return {
+      success: false,
+      status: 'missing_paid_at',
+      error: `Order ${order.id} is missing a valid payment capture timestamp (paid_at). CAPI Purchase event rejected.`
     };
   }
 

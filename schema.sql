@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS orders (
   status TEXT NOT NULL DEFAULT 'created', -- 'created', 'paid', 'failed'
   download_token TEXT UNIQUE,
   download_count INTEGER NOT NULL DEFAULT 0,
+  paid_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );

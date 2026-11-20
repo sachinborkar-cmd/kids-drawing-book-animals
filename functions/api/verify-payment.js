@@ -76,7 +76,7 @@ export async function onRequestPost(context) {
     if (env.DB) {
       try {
         existingOrder = await env.DB.prepare(`
-          SELECT id, razorpay_order_id, customer_email, amount, currency, status, download_token
+          SELECT id, razorpay_order_id, customer_email, amount, currency, status, download_token, paid_at
           FROM orders
           WHERE id = ? OR razorpay_order_id = ?
         `).bind(targetOrderId, razorpay_order_id).first();
@@ -105,6 +105,7 @@ export async function onRequestPost(context) {
           clientIp: request.headers?.get ? (request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for')) : null,
           userAgent: request.headers?.get ? request.headers.get('user-agent') : null,
           sourceUrl: `https://${(request.headers?.get ? request.headers.get('host') : null) || 'ebooks.trenzy.store'}/thank-you/?order_id=${encodeURIComponent(existingOrder.id)}`,
+          paidAt: existingOrder.paid_at,
           customFetch: env.customFetch
         };
         const earlyCapiPromise = sendCapiPurchaseEvent(existingOrder.id, env, earlyCapiContext);
@@ -153,6 +154,7 @@ export async function onRequestPost(context) {
     }
 
     // 4. Independent Razorpay API verification of captured payment status
+    let paymentData = null;
     if (rawKeySecret && rawKeyId && !isPlaceholder) {
       let rzpPaymentRes;
       try {
@@ -196,7 +198,6 @@ export async function onRequestPost(context) {
         });
       }
 
-      let paymentData;
       try {
         paymentData = await rzpPaymentRes.json();
       } catch (jsonErr) {
@@ -286,6 +287,23 @@ export async function onRequestPost(context) {
       }
     }
 
+    // Extract verified payment capture timestamp
+    let capturedIso = null;
+    if (paymentData && typeof paymentData.created_at === 'number' && paymentData.created_at > 0) {
+      capturedIso = new Date(paymentData.created_at * 1000).toISOString();
+    } else if (paymentData && paymentData.created_at) {
+      const parsed = Number(paymentData.created_at);
+      if (!Number.isNaN(parsed) && parsed > 0) {
+        capturedIso = new Date(parsed * 1000).toISOString();
+      }
+    }
+    if (!capturedIso && existingOrder?.paid_at) {
+      capturedIso = existingOrder.paid_at;
+    }
+    if (!capturedIso && isPlaceholder) {
+      capturedIso = new Date().toISOString();
+    }
+
     // Generate secure random download token (or preserve existing)
     let downloadToken = existingOrder?.download_token;
     if (!downloadToken) {
@@ -303,9 +321,10 @@ export async function onRequestPost(context) {
               razorpay_payment_id = ?,
               razorpay_signature = ?,
               download_token = COALESCE(download_token, ?),
+              paid_at = COALESCE(paid_at, ?),
               updated_at = datetime('now')
           WHERE razorpay_order_id = ? OR id = ?
-        `).bind(razorpay_payment_id, razorpay_signature || '', downloadToken, razorpay_order_id, targetOrderId).run();
+        `).bind(razorpay_payment_id, razorpay_signature || '', downloadToken, capturedIso, razorpay_order_id, targetOrderId).run();
 
         // Asynchronously dispatch purchase confirmation email with PDF attachment
         // Production environment detection takes precedence; staging/unknown/conflicting environments fail closed
@@ -329,6 +348,8 @@ export async function onRequestPost(context) {
           clientIp: request.headers?.get ? (request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for')) : null,
           userAgent: request.headers?.get ? request.headers.get('user-agent') : null,
           sourceUrl: `https://${(request.headers?.get ? request.headers.get('host') : null) || 'ebooks.trenzy.store'}/thank-you/?order_id=${encodeURIComponent(targetOrderId)}`,
+          paidAt: capturedIso,
+          paymentCreatedAt: paymentData?.created_at,
           customFetch: env.customFetch
         };
         const capiPromise = sendCapiPurchaseEvent(targetOrderId, env, capiContext);
