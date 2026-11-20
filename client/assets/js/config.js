@@ -41,7 +41,7 @@ const PRODUCT_CONFIG = {
   // Analytics placeholders (Can be injected or configured)
   analytics: {
     metaPixelId: '3370053963196277', // Meta Pixel ID (Kids Drawing Book)
-    enableMetaConversions: false, // Standard PageView only; conversion events disabled
+    enableMetaConversions: true, // Conversion events active on staging branch for verification
     ga4MeasurementId: '', // Set your GA4 ID here e.g. 'G-XXXXXXXXXX'
     gtmContainerId: '' // Set your GTM Container ID here e.g. 'GTM-XXXXXX'
   }

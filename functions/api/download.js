@@ -29,7 +29,7 @@ export async function onRequestGet({ request, env }) {
     if (env.DB) {
       try {
         orderRecord = await env.DB.prepare(`
-          SELECT id, razorpay_order_id, status, download_token, customer_email, download_count
+          SELECT id, razorpay_order_id, amount, currency, status, download_token, customer_email, download_count
           FROM orders
           WHERE (id = ? OR razorpay_order_id = ?) AND download_token = ?
         `).bind(orderId, orderId, token).first();
@@ -128,8 +128,18 @@ export async function onRequestGet({ request, env }) {
       return Response.redirect(presignedUrl, 302);
     }
 
+    const resolvedOrderId = orderRecord ? orderRecord.id : orderId;
+    const resolvedAmount = orderRecord && typeof orderRecord.amount === 'number' && orderRecord.amount > 0
+      ? orderRecord.amount
+      : parseInt(env.PRODUCT_PRICE || '1', 10);
+    const resolvedCurrency = (orderRecord && orderRecord.currency) ? orderRecord.currency : (env.PRODUCT_CURRENCY || 'INR');
+
     return new Response(JSON.stringify({
       success: true,
+      status: 'paid',
+      order_id: resolvedOrderId,
+      amount: resolvedAmount,
+      currency: resolvedCurrency,
       download_url: presignedUrl,
       filename: 'Kids_Drawing_Book_Animals_School_Edition.pdf',
       expires_in: expirySeconds

@@ -107,6 +107,15 @@
       const p = window.PRODUCT_CONFIG;
       if (!p) return;
 
+      // In-session guard: Do not fire multiple events for repeated CTA clicks or modal re-opens in the same session
+      const sessionKey = 'meta_initiate_checkout_tracked';
+      try {
+        if (typeof sessionStorage !== 'undefined' && sessionStorage.getItem(sessionKey)) {
+          console.debug('[Analytics] InitiateCheckout already tracked in this session. Skipping duplicate.');
+          return;
+        }
+      } catch (e) {}
+
       const payload = {
         content_name: p.title,
         content_category: 'Children Activity Books',
@@ -136,27 +145,52 @@
         window.dataLayer.push({ event: 'initiate_checkout', ...payload });
       }
 
+      try {
+        if (typeof sessionStorage !== 'undefined') {
+          sessionStorage.setItem(sessionKey, 'true');
+        }
+      } catch (e) {}
+
       console.debug('[Analytics] InitiateCheckout tracked:', payload);
     },
 
-    // 4. Purchase (Only on verified payment confirmation, deduplicated by orderId)
+    // 4. Purchase (Dispatched on verified payment confirmation, deduplicated by orderId)
+    // IMPORTANT DELIVERY LIMITATION:
+    // Calling window.fbq('track', 'Purchase', ...) queues the event in the client-side JavaScript runtime.
+    // A successful fbq queue operation does NOT guarantee that Meta's network endpoint received the beacon
+    // (e.g. client ad blockers such as AdBlock360, Brave Shields, network timeouts, or browser tracking
+    // prevention can drop the outgoing HTTP request).
+    // The localStorage idempotency flag suppresses duplicate client-side dispatches on page refresh,
+    // but does NOT guarantee cross-device deduplication or delivery receipt.
+    // For guaranteed conversion delivery, the future Conversions API (CAPI) architecture will independently
+    // dispatch server-side events using the identical stable order event ID (order_id).
     trackPurchase: function(orderId, amount, currency) {
       if (!orderId) {
         console.warn('[Analytics] trackPurchase called without orderId. Ignored.');
         return;
       }
 
-      // Idempotency: Prevent duplicate purchase events
+      // Local browser idempotency guard (per-browser / per-device storage):
+      // Prevents duplicate client-side event queueing on page refreshes or repeated tab visits in this browser.
+      // (Does not guarantee delivery receipt or prevent cross-browser/cross-device duplicate visits).
       const storageKey = `purchase_tracked_${orderId}`;
-      if (sessionStorage.getItem(storageKey) || localStorage.getItem(storageKey)) {
-        console.info(`[Analytics] Purchase event already tracked for order ${orderId}. Skipping duplicate.`);
-        return;
-      }
+      try {
+        if (typeof sessionStorage !== 'undefined' && sessionStorage.getItem(storageKey)) {
+          console.info(`[Analytics] Purchase event already queued for order ${orderId} in this session. Skipping duplicate.`);
+          return;
+        }
+        if (typeof localStorage !== 'undefined' && localStorage.getItem(storageKey)) {
+          console.info(`[Analytics] Purchase event already queued for order ${orderId} in this browser. Skipping duplicate.`);
+          return;
+        }
+      } catch (e) {}
 
       const p = window.PRODUCT_CONFIG;
-      const finalAmount = amount || p?.pricing.price || 1;
+      const finalAmount = (typeof amount === 'number' && amount > 0) ? amount : (p?.pricing.price || 1);
       const finalCurrency = currency || p?.pricing.currency || 'INR';
 
+      // Strictly zero PII: Only product and order metadata.
+      // Customer name, email, phone, IP, Razorpay signatures, and download tokens are strictly excluded.
       const payload = {
         content_name: p ? p.title : 'Kids Drawing Book – Animals',
         content_type: 'product',
@@ -167,9 +201,10 @@
         num_items: 1
       };
 
-      // Meta Pixel (gated: conversion events not active until explicitly enabled)
+      // Meta Pixel: Queue event with eventID for deduplication with future server-side CAPI.
+      // Note: This queues the event in memory; network transmission depends on browser connectivity and ad blockers.
       if (typeof window.fbq === 'function' && window.PRODUCT_CONFIG?.analytics?.enableMetaConversions === true) {
-        window.fbq('track', 'Purchase', payload);
+        window.fbq('track', 'Purchase', payload, { eventID: orderId });
       }
 
       // GA4
@@ -192,13 +227,13 @@
         window.dataLayer.push({ event: 'purchase', ...payload });
       }
 
-      // Mark as tracked
+      // Record browser-level dispatch in local storage to prevent duplicate queueing on reloads
       try {
-        sessionStorage.setItem(storageKey, 'true');
-        localStorage.setItem(storageKey, 'true');
+        if (typeof sessionStorage !== 'undefined') sessionStorage.setItem(storageKey, 'true');
+        if (typeof localStorage !== 'undefined') localStorage.setItem(storageKey, 'true');
       } catch (e) {}
 
-      console.log('[Analytics] Verified Purchase tracked successfully:', payload);
+      console.log('[Analytics] Verified Purchase event dispatched to analytics queue:', payload);
     }
   };
 

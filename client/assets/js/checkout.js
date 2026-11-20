@@ -263,16 +263,9 @@
           throw new Error(data.error || 'Payment verification failed. Please contact support.');
         }
 
-        // Fire Purchase Conversion Event
-        if (window.Analytics) {
-          window.Analytics.trackPurchase(
-            this.currentOrderId,
-            window.PRODUCT_CONFIG?.pricing?.price || 1,
-            window.PRODUCT_CONFIG?.pricing?.currency || 'INR'
-          );
-        }
-
-        // Redirect to Thank You + Download Page only after verified success
+        // Redirect to Thank You + Download Page only after verified success.
+        // Purchase conversion tracking is executed authoritatively on the Thank You page
+        // following complete server-side verification of payment status and download authorization.
         window.location.href = data.redirect_url;
 
       } catch (err) {

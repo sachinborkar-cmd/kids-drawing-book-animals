@@ -3210,6 +3210,163 @@ await test('Refund calculation: Partial ₹1 refund (< 100 paise) sets status to
   assert.equal(mockDb.orders.get(rzpId).status, 'partially_refunded', 'Partial ₹1 refund must update status to partially_refunded');
 });
 
+// 11. META CONVERSION TRACKING & STRICT PURCHASE AUTHORIZATION (PHASE 2)
+console.log('\n[Audit Test 11: Meta Conversion Tracking & Strict Purchase Authorization (Phase 2)]');
+
+await test('GET /api/download returns complete order metadata (success, status=paid, order_id, amount, currency) on verified paid orders', async () => {
+  const testOrderId = `ord_meta_test_${Date.now()}`;
+  const testToken = `tok_meta_valid_${Date.now()}`;
+  mockDb.orders.set(testOrderId, {
+    id: testOrderId,
+    razorpay_order_id: `rzp_meta_${Date.now()}`,
+    customer_name: 'Priya Sharma',
+    customer_email: 'priya@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid',
+    download_token: testToken,
+    download_count: 0
+  });
+
+  const req = { url: `http://localhost/api/download?order_id=${testOrderId}&token=${testToken}` };
+  const res = await handleDownload({ request: req, env: { ...mockEnv, PRODUCT_PRICE: '1' } });
+  assert.equal(res.status, 200);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.success, true, 'Download response must have success: true');
+  assert.equal(data.status, 'paid', 'Download response must return server-confirmed status: paid');
+  assert.equal(data.order_id, testOrderId, 'Download response must return exact verified order_id');
+  assert.equal(data.amount, 1, 'Download response must return positive verified amount (1)');
+  assert.equal(data.currency, 'INR', 'Download response must return currency: INR');
+  assert(data.download_url, 'Download response must contain presigned download_url');
+});
+
+await test('GET /api/download rejects unpaid orders (status=created) and invalid tokens with HTTP 403', async () => {
+  const unpaidOrderId = `ord_meta_unpaid_${Date.now()}`;
+  const unpaidToken = `tok_meta_unpaid_${Date.now()}`;
+  mockDb.orders.set(unpaidOrderId, {
+    id: unpaidOrderId,
+    razorpay_order_id: `rzp_unpaid_${Date.now()}`,
+    customer_name: 'Unpaid Customer',
+    customer_email: 'unpaid@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'created', // UNPAID
+    download_token: unpaidToken,
+    download_count: 0
+  });
+
+  // 1. Unpaid order
+  const reqUnpaid = { url: `http://localhost/api/download?order_id=${unpaidOrderId}&token=${unpaidToken}` };
+  const resUnpaid = await handleDownload({ request: reqUnpaid, env: mockEnv });
+  assert.equal(resUnpaid.status, 403, 'Unpaid order must be rejected with HTTP 403');
+  const dataUnpaid = JSON.parse(await resUnpaid.text());
+  assert.equal(dataUnpaid.success, false, 'Unpaid order response must have success: false');
+
+  // 2. Invalid token
+  const reqBadToken = { url: `http://localhost/api/download?order_id=${unpaidOrderId}&token=fabricated_token` };
+  const resBadToken = await handleDownload({ request: reqBadToken, env: mockEnv });
+  assert.equal(resBadToken.status, 403, 'Fabricated token must be rejected with HTTP 403');
+  const dataBadToken = JSON.parse(await resBadToken.text());
+  assert.equal(dataBadToken.success, false, 'Fabricated token response must have success: false');
+});
+
+await test('thank-you.js strictly validates complete /api/download response before firing Purchase (HTTP 200 alone rejected)', async () => {
+  const thankYouJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/thank-you.js'), 'utf8');
+  assert(!thankYouJs.includes('// Idempotent Purchase Event Tracking on Thank You Page\n  if (window.Analytics && orderId) {'),
+    'Premature trackPurchase before /api/download fetch must be removed');
+  assert(thankYouJs.includes('data.status === \'paid\''), 'Must validate server-confirmed status is paid');
+  assert(thankYouJs.includes('typeof data.amount === \'number\' && data.amount > 0'), 'Must validate positive verified amount');
+  assert(thankYouJs.includes('data.currency === \'INR\''), 'Must validate currency is strictly INR');
+  assert(thankYouJs.includes('typeof data.order_id === \'string\' && data.order_id.trim().length > 0'), 'Must validate valid order_id');
+  assert(thankYouJs.includes('window.Analytics.trackPurchase('),
+    'Must call trackPurchase inside download verification handler');
+});
+
+await test('checkout.js does NOT fire premature browser Purchase event before redirect', async () => {
+  const checkoutJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/checkout.js'), 'utf8');
+  assert(!checkoutJs.includes('window.Analytics.trackPurchase('),
+    'checkout.js must not call trackPurchase before redirect (Purchase tracked exclusively on thank-you page)');
+  assert(checkoutJs.includes('window.location.href = data.redirect_url;'),
+    'checkout.js must cleanly redirect to thank-you URL after payment verification');
+});
+
+await test('analytics.js passes eventID as 4th parameter in fbq(track, Purchase) for Meta Deduplication', async () => {
+  const analyticsJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/analytics.js'), 'utf8');
+  assert(analyticsJs.includes("window.fbq('track', 'Purchase', payload, { eventID: orderId });"),
+    'Must pass { eventID: orderId } as 4th argument in fbq Purchase call for Meta Deduplication');
+});
+
+await test('analytics.js enforces in-session guard for InitiateCheckout to prevent duplicate events on modal close/reopen', async () => {
+  const analyticsJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/analytics.js'), 'utf8');
+  assert(analyticsJs.includes('meta_initiate_checkout_tracked'), 'Must use in-session key meta_initiate_checkout_tracked');
+  assert(analyticsJs.includes('sessionStorage.getItem(sessionKey)'), 'Must check sessionStorage before tracking InitiateCheckout');
+  assert(analyticsJs.includes('sessionStorage.setItem(sessionKey, \'true\')'), 'Must set sessionStorage flag after tracking InitiateCheckout');
+});
+
+await test('analytics.js and thank-you.js exclude all customer PII, tokens, and signatures from Meta event payloads', async () => {
+  const analyticsJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/analytics.js'), 'utf8');
+  const purchasePayloadIdx = analyticsJs.indexOf('// Strictly zero PII: Only product and order metadata');
+  assert(purchasePayloadIdx !== -1, 'Purchase zero-PII section comment must exist');
+  const purchasePayloadBlock = analyticsJs.slice(purchasePayloadIdx, purchasePayloadIdx + 600);
+  assert(!purchasePayloadBlock.includes('customer_email') && !purchasePayloadBlock.includes('email:'), 'Must not contain email');
+  assert(!purchasePayloadBlock.includes('customer_name') && !purchasePayloadBlock.includes('name: customer'), 'Must not contain customer name');
+  assert(!purchasePayloadBlock.includes('customer_phone') && !purchasePayloadBlock.includes('phone:'), 'Must not contain phone');
+  assert(!purchasePayloadBlock.includes('download_token') && !purchasePayloadBlock.includes('token:'), 'Must not contain token');
+  assert(!purchasePayloadBlock.includes('razorpay_signature') && !purchasePayloadBlock.includes('signature:'), 'Must not contain signature');
+});
+
+await test('analytics.js localStorage and sessionStorage idempotency guards suppress duplicate Purchase events on page refresh', async () => {
+  const analyticsJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/analytics.js'), 'utf8');
+  assert(analyticsJs.includes('sessionStorage.getItem(storageKey)'), 'Must check sessionStorage for order idempotency');
+  assert(analyticsJs.includes('localStorage.getItem(storageKey)'), 'Must check localStorage for order idempotency');
+  assert(analyticsJs.includes('sessionStorage.setItem(storageKey, \'true\')'), 'Must mark order as tracked in sessionStorage');
+  assert(analyticsJs.includes('localStorage.setItem(storageKey, \'true\')'), 'Must mark order as tracked in localStorage');
+});
+
+await test('Staging vs Production pricing configuration: Staging uses ₹1 and enableMetaConversions: true; Production uses ₹149', async () => {
+  const configJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/config.js'), 'utf8');
+  assert(configJs.includes('price: 1,'), 'Staging client config must use ₹1 test price');
+  assert(configJs.includes('currency: \'INR\','), 'Staging client config must use INR currency');
+  assert(configJs.includes('enableMetaConversions: true,'), 'Staging client config must have enableMetaConversions: true');
+  assert(configJs.includes("metaPixelId: '3370053963196277'"), 'Pixel ID 3370053963196277 must be preserved');
+
+  // Verify production env template / server config defaults
+  assert.equal(mockEnv.PRODUCT_PRICE, '149', 'Production environment price must be 149');
+  assert.equal(mockEnv.PRODUCT_CURRENCY, 'INR', 'Production currency must be INR');
+});
+
+await test('ViewContent is triggered exclusively on landing page and not on thank-you or legal pages', async () => {
+  const landingJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/landing.js'), 'utf8');
+  assert(landingJs.includes('window.Analytics.trackViewContent()'), 'landing.js must call window.Analytics.trackViewContent()');
+
+  // Verify thank-you.js does NOT call trackViewContent
+  const thankYouJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/thank-you.js'), 'utf8');
+  assert(!thankYouJs.includes('trackViewContent'), 'thank-you.js must NOT trigger ViewContent');
+
+  // Verify legal pages do NOT load landing.js or call trackViewContent
+  const legalFiles = ['terms.html', 'privacy.html', 'refund.html'];
+  legalFiles.forEach(file => {
+    const content = fs.readFileSync(path.join(ROOT_DIR, 'client/legal', file), 'utf8');
+    assert(!content.includes('landing.js'), `${file} must not load landing.js`);
+    assert(!content.includes('trackViewContent'), `${file} must not invoke trackViewContent`);
+  });
+
+  // Verify existing PageView implementation remains unchanged across all 6 HTML files
+  const allHtmlFiles = [
+    'client/index.html',
+    'client/ebook/index.html',
+    'client/thank-you/index.html',
+    'client/legal/terms.html',
+    'client/legal/privacy.html',
+    'client/legal/refund.html'
+  ];
+  allHtmlFiles.forEach(file => {
+    const content = fs.readFileSync(path.join(ROOT_DIR, file), 'utf8');
+    assert(content.includes("fbq('init', '3370053963196277')"), `${file} must preserve fbq('init', '3370053963196277')`);
+    assert(content.includes("fbq('track', 'PageView')"), `${file} must preserve fbq('track', 'PageView')`);
+  });
+});
+
 console.log('\n======================================================');
 console.log(` TOTAL AUDIT RESULTS: ${passed} PASSED, ${failed} FAILED`);
 console.log('======================================================\n');
