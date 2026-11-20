@@ -1,4 +1,5 @@
 import { processOrderEmail, classifyEmailEnvironment } from './_email.js';
+import { sendCapiPurchaseEvent } from './_meta_capi.js';
 
 /**
  * POST /api/razorpay-webhook
@@ -133,6 +134,26 @@ export async function onRequestPost(context) {
           } catch (emailErr) {
             console.error('[Webhook Email Dispatch Error]:', emailErr.message);
           }
+        }
+
+        // Asynchronously dispatch Meta Conversions API (CAPI) Purchase event
+        try {
+          const capiContext = {
+            clientIp: request.headers?.get ? request.headers.get('cf-connecting-ip') : null,
+            userAgent: request.headers?.get ? request.headers.get('user-agent') : null,
+            sourceUrl: `https://${(request.headers?.get ? request.headers.get('host') : null) || 'ebooks.trenzy.store'}/thank-you/?order_id=${encodeURIComponent(orderId)}`,
+            customFetch: env.customFetch
+          };
+          const capiPromise = sendCapiPurchaseEvent(orderId, env, capiContext);
+          if (typeof waitUntil === 'function') {
+            waitUntil(capiPromise);
+          } else if (typeof context !== 'undefined' && context && typeof context.waitUntil === 'function') {
+            context.waitUntil(capiPromise);
+          } else {
+            await capiPromise;
+          }
+        } catch (capiErr) {
+          console.error('[Webhook CAPI Dispatch Error]:', capiErr.message);
         }
       }
     } else if (eventType === 'payment.failed') {

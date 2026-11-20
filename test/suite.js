@@ -39,6 +39,15 @@ import {
   EXPECTED_STAGING_BUCKET,
   EXPECTED_STAGING_RAZORPAY_KEY
 } from '../functions/api/_email.js';
+import {
+  sendCapiPurchaseEvent,
+  buildCapiPurchasePayload,
+  sha256Hex,
+  hashPhone,
+  hashCustomerNames,
+  sanitizeErrorMessage,
+  META_PIXEL_ID_DEFAULT
+} from '../functions/api/_meta_capi.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -50,6 +59,7 @@ class MockD1 {
     this.orders = new Map();
     this.webhooks = new Map();
     this.outbox = new Map();
+    this.capi_events = new Map();
   }
 
   prepare(query) {
@@ -160,6 +170,73 @@ class MockD1 {
             });
             return { success: true, meta: { changes: 1 } };
           }
+          if (q.startsWith('INSERT INTO capi_events')) {
+            let id, order_id, meta_event_id;
+            if (args.length === 3) {
+              [id, order_id, meta_event_id] = args;
+            } else {
+              id = args[0];
+              order_id = args[1];
+              meta_event_id = args[args.length - 1];
+            }
+            const key = `${order_id}_Purchase`;
+            if (this.capi_events.has(key)) {
+              throw new Error('UNIQUE constraint failed: capi_events.order_id, capi_events.event_name');
+            }
+            this.capi_events.set(key, {
+              id,
+              order_id,
+              event_name: 'Purchase',
+              status: 'pending',
+              attempts: 0,
+              last_attempt_at: null,
+              sent_at: null,
+              meta_event_id: meta_event_id || order_id,
+              fbtrace_id: null,
+              error_message: null
+            });
+            return { success: true, meta: { changes: 1 } };
+          }
+          if (q.startsWith('UPDATE capi_events') && q.includes("status = 'sending'")) {
+            const [order_id] = args;
+            const key = `${order_id}_Purchase`;
+            const rec = this.capi_events.get(key);
+            const isStale = rec && rec.status === 'sending' && rec.last_attempt_at && (Date.now() - new Date(rec.last_attempt_at).getTime() > 5 * 60 * 1000);
+            if (rec && (rec.status === 'pending' || rec.status === 'failed' || isStale) && rec.attempts < 3) {
+              rec.status = 'sending';
+              rec.attempts++;
+              rec.last_attempt_at = new Date().toISOString();
+              return { success: true, meta: { changes: 1 } };
+            }
+            return { success: true, meta: { changes: 0 } };
+          }
+          if (q.startsWith('UPDATE capi_events') && q.includes("status = 'sent'")) {
+            const [fbtrace_id, order_id] = args;
+            const key = `${order_id}_Purchase`;
+            const rec = this.capi_events.get(key);
+            if (rec) {
+              rec.status = 'sent';
+              rec.sent_at = new Date().toISOString();
+              rec.fbtrace_id = fbtrace_id || null;
+              rec.error_message = null;
+              return { success: true, meta: { changes: 1 } };
+            }
+            return { success: true, meta: { changes: 0 } };
+          }
+          if (q.startsWith('UPDATE capi_events') && q.includes("status = 'failed'")) {
+            const err_msg = args[0];
+            const order_id = args[args.length - 1];
+            const fbtrace_id = args.length > 2 ? args[1] : null;
+            const key = `${order_id}_Purchase`;
+            const rec = this.capi_events.get(key);
+            if (rec) {
+              rec.status = 'failed';
+              rec.error_message = err_msg;
+              if (fbtrace_id) rec.fbtrace_id = fbtrace_id;
+              return { success: true, meta: { changes: 1 } };
+            }
+            return { success: true, meta: { changes: 0 } };
+          }
           if (q.startsWith('UPDATE email_outbox') && q.includes("status = 'processing'")) {
             const [order_id, email_type] = args;
             const key = `${order_id}_${email_type}`;
@@ -218,6 +295,11 @@ class MockD1 {
             const [order_id, email_type] = args;
             const key = `${order_id}_${email_type}`;
             return this.outbox.get(key) || null;
+          }
+          if (q.includes('FROM capi_events')) {
+            const [order_id] = args;
+            const key = `${order_id}_Purchase`;
+            return this.capi_events.get(key) || null;
           }
           return null;
         }
@@ -298,6 +380,44 @@ globalThis.fetch = async (url, options = {}) => {
     };
   }
 
+  if (urlStr.includes('graph.facebook.com')) {
+    if (globalThis.__mockMetaNetworkError) {
+      throw new Error('Meta network connection reset simulation');
+    }
+    if (globalThis.__mockMetaApiError) {
+      return {
+        ok: false,
+        status: 400,
+        statusText: 'Bad Request',
+        json: async () => ({
+          error: {
+            message: 'Invalid parameter in Meta CAPI payload simulation',
+            type: 'OAuthException',
+            code: 100,
+            fbtrace_id: 'tr_mock_err_999'
+          }
+        })
+      };
+    }
+    globalThis.__lastMetaCapiCall = {
+      url: urlStr,
+      options,
+      body: options.body ? JSON.parse(options.body) : null
+    };
+    if (!globalThis.__metaCapiCallCount) globalThis.__metaCapiCallCount = 0;
+    globalThis.__metaCapiCallCount++;
+    return {
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      json: async () => ({
+        events_received: 1,
+        fbtrace_id: 'tr_mock_success_123',
+        messages: []
+      })
+    };
+  }
+
   return originalFetch(url, options);
 };
 
@@ -308,6 +428,8 @@ const mockEnv = {
   ENVIRONMENT: 'production',
   PRODUCT_PRICE: '149',
   PRODUCT_CURRENCY: 'INR',
+  META_CAPI_ACCESS_TOKEN: 'MOCK_CAPI_TEST_ACCESS_TOKEN_123',
+  META_PIXEL_ID: '3370053963196277',
   RAZORPAY_KEY_ID: 'rzp_live_test_genuine_key_123',
   RAZORPAY_KEY_SECRET: 'test_secret_key_123',
   RAZORPAY_WEBHOOK_SECRET: 'webhook_secret_xyz',
@@ -3799,6 +3921,448 @@ await test('Payment verification in conflicting environment marks order paid in 
   assert.equal(mockDb.orders.get(conflictOrderId).status, 'paid', 'D1 order status must be paid');
   const outbox = mockDb.outbox.get(`${conflictOrderId}_purchase_delivery`);
   assert(!outbox, 'Conflicting environment must NOT dispatch email');
+});
+
+console.log('\n[Audit Test 12: Meta Conversions API (CAPI) Server-Side Tracking & Deduplication (Phase 3)]');
+
+await test('Valid paid order creates a CAPI Purchase event', async () => {
+  const orderId = `ord_capi_valid_${Date.now()}`;
+  const rzpId = `rzp_capi_valid_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: rzpId,
+    customer_name: 'Jane Doe',
+    customer_email: 'jane.doe@example.com',
+    customer_phone: '9876543210',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid'
+  });
+
+  globalThis.__lastMetaCapiCall = null;
+  const res = await sendCapiPurchaseEvent(orderId, mockEnv);
+  assert.equal(res.success, true);
+  assert.equal(res.status, 'sent');
+  assert.equal(res.events_received, 1);
+  assert(res.fbtrace_id, 'fbtrace_id must be returned');
+
+  const capiRec = mockDb.capi_events.get(`${orderId}_Purchase`);
+  assert(capiRec, 'capi_events record must exist in D1');
+  assert.equal(capiRec.status, 'sent');
+  assert.equal(capiRec.attempts, 1);
+  assert.equal(capiRec.meta_event_id, orderId);
+
+  assert(globalThis.__lastMetaCapiCall, 'Meta Graph API must have been called');
+  assert(globalThis.__lastMetaCapiCall.url.includes('/events'), 'Must POST to /events');
+  assert(globalThis.__lastMetaCapiCall.url.includes(META_PIXEL_ID_DEFAULT), 'Must target Pixel ID');
+  const payload = globalThis.__lastMetaCapiCall.body;
+  assert(Array.isArray(payload.data) && payload.data.length === 1);
+  const ev = payload.data[0];
+  assert.equal(ev.event_name, 'Purchase');
+  assert.equal(ev.event_id, orderId, 'event_id must exactly match stable order ID');
+  assert.equal(ev.action_source, 'website');
+  assert.equal(ev.custom_data.value, 1);
+  assert.equal(ev.custom_data.currency, 'INR');
+  assert.equal(ev.custom_data.order_id, orderId);
+
+  const expectedEmailHash = await sha256Hex('jane.doe@example.com');
+  const expectedPhoneHash = await sha256Hex('9876543210');
+  const expectedFirstNameHash = await sha256Hex('jane');
+  const expectedLastNameHash = await sha256Hex('doe');
+  assert.deepEqual(ev.user_data.em, [expectedEmailHash]);
+  assert.deepEqual(ev.user_data.ph, [expectedPhoneHash]);
+  assert.deepEqual(ev.user_data.fn, [expectedFirstNameHash]);
+  assert.deepEqual(ev.user_data.ln, [expectedLastNameHash]);
+});
+
+await test('Pending order does not create an event', async () => {
+  const orderId = `ord_capi_pending_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: `rzp_pending_${Date.now()}`,
+    customer_email: 'pending@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'created'
+  });
+
+  globalThis.__lastMetaCapiCall = null;
+  const res = await sendCapiPurchaseEvent(orderId, mockEnv);
+  assert.equal(res.success, false);
+  assert.equal(res.status, 'order_not_paid');
+  assert.equal(globalThis.__lastMetaCapiCall, null, 'Must NOT dispatch to Meta for pending order');
+  const capiRec = mockDb.capi_events.get(`${orderId}_Purchase`);
+  assert(!capiRec, 'Must not create capi_events record for non-paid order');
+});
+
+await test('Failed payment does not create an event', async () => {
+  const orderId = `ord_capi_failed_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: `rzp_failed_${Date.now()}`,
+    customer_email: 'failed@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'failed'
+  });
+
+  globalThis.__lastMetaCapiCall = null;
+  const res = await sendCapiPurchaseEvent(orderId, mockEnv);
+  assert.equal(res.success, false);
+  assert.equal(res.status, 'order_not_paid');
+  assert.equal(globalThis.__lastMetaCapiCall, null, 'Must NOT dispatch to Meta for failed order');
+});
+
+await test('Invalid order ID is rejected', async () => {
+  const res1 = await sendCapiPurchaseEvent('', mockEnv);
+  assert.equal(res1.success, false);
+  assert.equal(res1.status, 'invalid_order_id');
+
+  const res2 = await sendCapiPurchaseEvent(null, mockEnv);
+  assert.equal(res2.success, false);
+  assert.equal(res2.status, 'invalid_order_id');
+
+  const res3 = await sendCapiPurchaseEvent('ord_non_existent_12345', mockEnv);
+  assert.equal(res3.success, false);
+  assert.equal(res3.status, 'order_not_found');
+});
+
+await test('Invalid amount is rejected', async () => {
+  const orderId = `ord_capi_bad_amt_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: `rzp_bad_amt_${Date.now()}`,
+    customer_email: 'badamt@example.com',
+    amount: 0,
+    currency: 'INR',
+    status: 'paid'
+  });
+
+  const res = await sendCapiPurchaseEvent(orderId, mockEnv);
+  assert.equal(res.success, false);
+  assert.equal(res.status, 'invalid_amount');
+});
+
+await test('Wrong currency is rejected', async () => {
+  const orderId = `ord_capi_bad_curr_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: `rzp_bad_curr_${Date.now()}`,
+    customer_email: 'badcurr@example.com',
+    amount: 1,
+    currency: 'USD',
+    status: 'paid'
+  });
+
+  const res = await sendCapiPurchaseEvent(orderId, mockEnv);
+  assert.equal(res.success, false);
+  assert.equal(res.status, 'invalid_currency');
+});
+
+await test('Missing CAPI token fails safely', async () => {
+  const orderId = `ord_capi_no_token_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: `rzp_no_token_${Date.now()}`,
+    customer_email: 'notoken@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid'
+  });
+
+  const envWithoutToken = { ...mockEnv, META_CAPI_ACCESS_TOKEN: '' };
+  globalThis.__lastMetaCapiCall = null;
+  const res = await sendCapiPurchaseEvent(orderId, envWithoutToken);
+  assert.equal(res.success, false);
+  assert.equal(res.status, 'missing_token');
+  assert.equal(globalThis.__lastMetaCapiCall, null);
+  const capiRec = mockDb.capi_events.get(`${orderId}_Purchase`);
+  assert(capiRec, 'capi_events record created');
+  assert.equal(capiRec.status, 'failed');
+  assert(capiRec.error_message.includes('not configured'));
+});
+
+await test('Duplicate webhook delivery does not create duplicate events', async () => {
+  const orderId = `ord_wh_dup_${Date.now()}`;
+  const rzpOrderId = `order_wh_dup_${Date.now()}`;
+  const rzpPaymentId = `pay_wh_dup_${Date.now()}`;
+  mockDb.orders.set(rzpOrderId, {
+    id: orderId,
+    razorpay_order_id: rzpOrderId,
+    customer_email: 'wh_dup@example.com',
+    amount: 149,
+    currency: 'INR',
+    status: 'created'
+  });
+
+  const eventPayload = {
+    event: 'payment.captured',
+    event_id: `evt_wh_dup_${Date.now()}`,
+    payload: {
+      payment: {
+        entity: {
+          id: rzpPaymentId,
+          order_id: rzpOrderId,
+          status: 'captured',
+          amount: 14900,
+          currency: 'INR'
+        }
+      }
+    }
+  };
+  const rawBody = JSON.stringify(eventPayload);
+  const sig = await computeWebhookSig(rawBody, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+
+  globalThis.__metaCapiCallCount = 0;
+  const res1 = await handleWebhook({
+    request: {
+      headers: new Headers({ 'x-razorpay-signature': sig }),
+      text: async () => rawBody
+    },
+    env: mockEnv
+  });
+  assert.equal(res1.status, 200);
+
+  const res2 = await handleWebhook({
+    request: {
+      headers: new Headers({ 'x-razorpay-signature': sig }),
+      text: async () => rawBody
+    },
+    env: mockEnv
+  });
+  assert.equal(res2.status, 200);
+  const data2 = JSON.parse(await res2.text());
+  assert.equal(data2.status, 'already_processed');
+
+  assert.equal(globalThis.__metaCapiCallCount, 1, 'Meta CAPI must be called exactly once despite duplicate webhooks');
+  const capiRec = mockDb.capi_events.get(`${orderId}_Purchase`);
+  assert.equal(capiRec.status, 'sent');
+  assert.equal(capiRec.attempts, 1);
+});
+
+await test('Repeated payment verification does not create duplicate events', async () => {
+  const orderId = `ord_verify_dup_${Date.now()}`;
+  const rzpOrderId = `order_verify_dup_${Date.now()}`;
+  const rzpPaymentId = `pay_verify_dup_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: rzpOrderId,
+    customer_email: 'verify_dup@example.com',
+    amount: 149,
+    currency: 'INR',
+    status: 'created'
+  });
+
+  globalThis.__mockPaymentId = rzpPaymentId;
+  globalThis.__mockPaymentOrderId = rzpOrderId;
+  globalThis.__mockPaymentStatus = 'captured';
+  globalThis.__mockPaymentAmount = 14900;
+  globalThis.__mockPaymentCurrency = 'INR';
+
+  const sig = await computeWebhookSig(`${rzpOrderId}|${rzpPaymentId}`, mockEnv.RAZORPAY_KEY_SECRET);
+
+  globalThis.__metaCapiCallCount = 0;
+  const res1 = await handleVerifyPayment({
+    request: {
+      headers: new Headers({ 'cf-connecting-ip': '1.2.3.4', 'user-agent': 'TestAgent/1.0' }),
+      json: async () => ({
+        order_id: orderId,
+        razorpay_order_id: rzpOrderId,
+        razorpay_payment_id: rzpPaymentId,
+        razorpay_signature: sig
+      })
+    },
+    env: mockEnv
+  });
+  assert.equal(res1.status, 200);
+
+  const res2 = await handleVerifyPayment({
+    request: {
+      headers: new Headers({ 'cf-connecting-ip': '1.2.3.4', 'user-agent': 'TestAgent/1.0' }),
+      json: async () => ({
+        order_id: orderId,
+        razorpay_order_id: rzpOrderId,
+        razorpay_payment_id: rzpPaymentId,
+        razorpay_signature: sig
+      })
+    },
+    env: mockEnv
+  });
+  assert.equal(res2.status, 200);
+
+  delete globalThis.__mockPaymentId;
+  delete globalThis.__mockPaymentOrderId;
+  delete globalThis.__mockPaymentStatus;
+  delete globalThis.__mockPaymentAmount;
+  delete globalThis.__mockPaymentCurrency;
+
+  assert.equal(globalThis.__metaCapiCallCount, 1, 'Meta CAPI must be called exactly once despite repeated verification');
+  const capiRec = mockDb.capi_events.get(`${orderId}_Purchase`);
+  assert.equal(capiRec.status, 'sent');
+  assert.equal(capiRec.attempts, 1);
+});
+
+await test('Concurrent webhook and verification requests are idempotent', async () => {
+  const orderId = `ord_concurrent_${Date.now()}`;
+  const rzpOrderId = `order_concurrent_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: rzpOrderId,
+    customer_email: 'concurrent@example.com',
+    amount: 149,
+    currency: 'INR',
+    status: 'paid'
+  });
+
+  globalThis.__metaCapiCallCount = 0;
+  const [res1, res2] = await Promise.all([
+    sendCapiPurchaseEvent(orderId, mockEnv),
+    sendCapiPurchaseEvent(orderId, mockEnv)
+  ]);
+
+  const oneSuccess = (res1.status === 'sent' && (res2.status === 'lock_not_acquired' || res2.status === 'already_sent')) ||
+                     (res2.status === 'sent' && (res1.status === 'lock_not_acquired' || res1.status === 'already_sent'));
+  assert(oneSuccess, 'Exactly one concurrent worker must dispatch to Meta');
+  assert.equal(globalThis.__metaCapiCallCount, 1, 'Only 1 network call made to Meta Graph API');
+});
+
+await test('Meta API failure is recorded safely and can be retried without creating duplicate outbox records', async () => {
+  const orderId = `ord_capi_retry_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: `rzp_retry_${Date.now()}`,
+    customer_email: 'retry@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid'
+  });
+
+  globalThis.__mockMetaApiError = true;
+  const failRes = await sendCapiPurchaseEvent(orderId, mockEnv);
+  assert.equal(failRes.success, false);
+  assert.equal(failRes.status, 'meta_api_error');
+  assert.equal(failRes.fbtrace_id, 'tr_mock_err_999');
+
+  const failedRec = mockDb.capi_events.get(`${orderId}_Purchase`);
+  assert(failedRec, 'Record must exist');
+  assert.equal(failedRec.status, 'failed');
+  assert.equal(failedRec.attempts, 1);
+  assert.equal(mockDb.orders.get(orderId).status, 'paid', 'Order status must remain paid despite CAPI failure');
+
+  delete globalThis.__mockMetaApiError;
+  const retryRes = await sendCapiPurchaseEvent(orderId, mockEnv);
+  assert.equal(retryRes.success, true);
+  assert.equal(retryRes.status, 'sent');
+
+  const sentRec = mockDb.capi_events.get(`${orderId}_Purchase`);
+  assert.equal(sentRec.status, 'sent');
+  assert.equal(sentRec.attempts, 2, 'Attempts must increment on retry');
+  assert.equal(sentRec.fbtrace_id, 'tr_mock_success_123');
+  assert.equal(Array.from(mockDb.capi_events.keys()).filter(k => k.startsWith(orderId)).length, 1, 'Exactly 1 outbox record must exist');
+});
+
+await test('Token is never exposed in logs or responses', async () => {
+  const secretToken = 'EAABmockSecretAccessToken1234567890abcdef';
+  const envWithSecret = { ...mockEnv, META_CAPI_ACCESS_TOKEN: secretToken };
+  const orderId = `ord_capi_leak_check_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: `rzp_leak_${Date.now()}`,
+    customer_email: 'leakcheck@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid'
+  });
+
+  globalThis.__mockMetaApiError = true;
+  const res = await sendCapiPurchaseEvent(orderId, envWithSecret);
+  delete globalThis.__mockMetaApiError;
+
+  const resStr = JSON.stringify(res);
+  assert(!resStr.includes(secretToken), 'Response must not contain access token');
+
+  const capiRec = mockDb.capi_events.get(`${orderId}_Purchase`);
+  assert(!capiRec.error_message.includes(secretToken), 'Error message must not contain access token');
+
+  const rawErrMsg = `Failed to connect with token ${secretToken}`;
+  const sanitized = sanitizeErrorMessage(rawErrMsg);
+  assert(!sanitized.includes(secretToken), 'Sanitized string must not contain access token');
+  assert(sanitized.includes('[REDACTED_ACCESS_TOKEN]'));
+});
+
+await test('Staging email suppression remains functional alongside CAPI', async () => {
+  const orderId = `ord_staging_capi_email_${Date.now()}`;
+  const rzpOrderId = `order_stg_ce_${Date.now()}`;
+  const rzpPaymentId = `pay_stg_ce_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: rzpOrderId,
+    customer_email: 'staging_capi@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'created'
+  });
+
+  const stagingEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'staging',
+    ENVIRONMENT: 'preview',
+    PRODUCT_PRICE: '1',
+    META_CAPI_ACCESS_TOKEN: 'MOCK_STAGING_CAPI_TOKEN_123'
+  };
+
+  globalThis.__mockPaymentId = rzpPaymentId;
+  globalThis.__mockPaymentOrderId = rzpOrderId;
+  globalThis.__mockPaymentStatus = 'captured';
+  globalThis.__mockPaymentAmount = 100;
+  globalThis.__mockPaymentCurrency = 'INR';
+
+  const sig = await computeWebhookSig(`${rzpOrderId}|${rzpPaymentId}`, stagingEnv.RAZORPAY_KEY_SECRET);
+
+  globalThis.__lastMetaCapiCall = null;
+  const res = await handleVerifyPayment({
+    request: {
+      headers: new Headers({ 'cf-connecting-ip': '1.2.3.4' }),
+      json: async () => ({
+        order_id: orderId,
+        razorpay_order_id: rzpOrderId,
+        razorpay_payment_id: rzpPaymentId,
+        razorpay_signature: sig
+      })
+    },
+    env: stagingEnv
+  });
+
+  delete globalThis.__mockPaymentId;
+  delete globalThis.__mockPaymentOrderId;
+  delete globalThis.__mockPaymentStatus;
+  delete globalThis.__mockPaymentAmount;
+  delete globalThis.__mockPaymentCurrency;
+
+  assert.equal(res.status, 200);
+  assert.equal(mockDb.orders.get(orderId).status, 'paid');
+
+  const emailOutbox = mockDb.outbox.get(`${orderId}_purchase_delivery`);
+  assert(!emailOutbox, 'Staging email suppression must be preserved');
+
+  const capiRec = mockDb.capi_events.get(`${orderId}_Purchase`);
+  assert(capiRec, 'CAPI event record must exist');
+  assert.equal(capiRec.status, 'sent', 'CAPI event must be successfully dispatched in staging');
+});
+
+await test('Existing browser Pixel events remain unchanged', async () => {
+  const analyticsJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/analytics.js'), 'utf8');
+  const thankYouJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/thank-you.js'), 'utf8');
+  const landingJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/landing.js'), 'utf8');
+  const checkoutJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/checkout.js'), 'utf8');
+
+  assert(analyticsJs.includes("fbq('track', 'Purchase', payload, { eventID: orderId })"), 'fbq Purchase must pass eventID matching orderId');
+  assert(analyticsJs.includes("trackPageView"), 'PageView tracking function must exist');
+  assert(analyticsJs.includes("trackViewContent"), 'ViewContent tracking function must exist');
+  assert(analyticsJs.includes("trackInitiateCheckout"), 'InitiateCheckout tracking function must exist');
+  assert(thankYouJs.includes("window.Analytics.trackPurchase"), 'thank-you.js must invoke Analytics.trackPurchase on verified order');
+  assert(landingJs.includes("Analytics.trackViewContent"), 'landing.js must invoke trackViewContent');
+  assert(checkoutJs.includes("Analytics.trackInitiateCheckout"), 'checkout.js must invoke trackInitiateCheckout');
 });
 
 console.log('\n======================================================');

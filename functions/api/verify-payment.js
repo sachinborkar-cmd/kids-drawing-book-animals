@@ -1,5 +1,6 @@
 import { verifyRazorpaySignature } from './_aws_s3.js';
 import { processOrderEmail, classifyEmailEnvironment } from './_email.js';
+import { sendCapiPurchaseEvent } from './_meta_capi.js';
 
 /**
  * POST /api/verify-payment
@@ -99,6 +100,20 @@ export async function onRequestPost(context) {
 
       // Idempotency: If already paid, preserve existing download token (unaffected by subsequent price changes)
       if (existingOrder.status === 'paid' && existingOrder.download_token) {
+        // Trigger idempotent CAPI check in case previous attempt failed or webhook arrived first
+        const earlyCapiContext = {
+          clientIp: request.headers?.get ? (request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for')) : null,
+          userAgent: request.headers?.get ? request.headers.get('user-agent') : null,
+          sourceUrl: `https://${(request.headers?.get ? request.headers.get('host') : null) || 'ebooks.trenzy.store'}/thank-you/?order_id=${encodeURIComponent(existingOrder.id)}`,
+          customFetch: env.customFetch
+        };
+        const earlyCapiPromise = sendCapiPurchaseEvent(existingOrder.id, env, earlyCapiContext);
+        if (typeof waitUntil === 'function') {
+          waitUntil(earlyCapiPromise);
+        } else if (typeof context !== 'undefined' && context && typeof context.waitUntil === 'function') {
+          context.waitUntil(earlyCapiPromise);
+        }
+
         return new Response(JSON.stringify({
           success: true,
           verified: true,
@@ -307,6 +322,23 @@ export async function onRequestPost(context) {
             // Await in local test runners where waitUntil is not provided
             await emailPromise;
           }
+        }
+
+        // Asynchronously dispatch Meta Conversions API (CAPI) Purchase event
+        const capiContext = {
+          clientIp: request.headers?.get ? (request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for')) : null,
+          userAgent: request.headers?.get ? request.headers.get('user-agent') : null,
+          sourceUrl: `https://${(request.headers?.get ? request.headers.get('host') : null) || 'ebooks.trenzy.store'}/thank-you/?order_id=${encodeURIComponent(targetOrderId)}`,
+          customFetch: env.customFetch
+        };
+        const capiPromise = sendCapiPurchaseEvent(targetOrderId, env, capiContext);
+        if (typeof waitUntil === 'function') {
+          waitUntil(capiPromise);
+        } else if (typeof context !== 'undefined' && context && typeof context.waitUntil === 'function') {
+          context.waitUntil(capiPromise);
+        } else {
+          // Await in local test runners where waitUntil is not provided
+          await capiPromise;
         }
       } catch (dbErr) {
         console.error('[D1 Verify Update Error]:', dbErr);
