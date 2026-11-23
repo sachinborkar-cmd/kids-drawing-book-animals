@@ -1,4 +1,5 @@
-import { processOrderEmail } from './_email.js';
+import { processOrderEmail, classifyEmailEnvironment } from './_email.js';
+import { sendCapiPurchaseEvent } from './_meta_capi.js';
 
 /**
  * POST /api/razorpay-webhook
@@ -101,6 +102,20 @@ export async function onRequestPost(context) {
 
     if (eventType === 'payment.captured' || eventType === 'order.paid') {
       if (orderId && env.DB) {
+        // Extract authoritative payment capture timestamp from top-level webhook event.created_at
+        let authoritativeIso = null;
+        if (typeof event.created_at === 'number' && event.created_at > 0) {
+          authoritativeIso = new Date(event.created_at * 1000).toISOString();
+        } else if (event.created_at) {
+          const parsed = Number(event.created_at);
+          if (!Number.isNaN(parsed) && parsed > 0) {
+            authoritativeIso = new Date(parsed * 1000).toISOString();
+          }
+        }
+        if (!authoritativeIso) {
+          authoritativeIso = new Date().toISOString();
+        }
+
         // Ensure order is marked paid and has a download token
         const tokenBytes = new Uint8Array(24);
         crypto.getRandomValues(tokenBytes);
@@ -111,22 +126,56 @@ export async function onRequestPost(context) {
           SET status = 'paid',
               razorpay_payment_id = COALESCE(razorpay_payment_id, ?),
               download_token = COALESCE(download_token, ?),
+              paid_at = CASE
+                          WHEN paid_at_source IS NULL OR paid_at_source != 'webhook' THEN ?
+                          WHEN ? > paid_at THEN ?
+                          ELSE paid_at
+                        END,
+              paid_at_source = 'webhook',
               updated_at = datetime('now')
           WHERE razorpay_order_id = ?
-        `).bind(paymentId || '', downloadToken, orderId).run();
+        `).bind(paymentId || '', downloadToken, authoritativeIso, authoritativeIso, authoritativeIso, orderId).run();
 
         // Asynchronously dispatch purchase confirmation email with PDF attachment
-        try {
-          const emailPromise = processOrderEmail(orderId, env);
-          if (typeof waitUntil === 'function') {
-            waitUntil(emailPromise);
-          } else if (typeof context !== 'undefined' && context && typeof context.waitUntil === 'function') {
-            context.waitUntil(emailPromise);
-          } else {
-            await emailPromise;
+        // Production environment detection takes precedence; staging/unknown/conflicting environments fail closed
+        const envCheck = classifyEmailEnvironment(env);
+        if (envCheck.shouldSuppressPurchaseDelivery) {
+          console.info(`[Razorpay Webhook]: Staging email suppression active for order ${orderId}. Skipping automatic email dispatch (${envCheck.reason}).`);
+        } else {
+          try {
+            const emailPromise = processOrderEmail(orderId, env);
+            if (typeof waitUntil === 'function') {
+              waitUntil(emailPromise);
+            } else if (typeof context !== 'undefined' && context && typeof context.waitUntil === 'function') {
+              context.waitUntil(emailPromise);
+            } else {
+              await emailPromise;
+            }
+          } catch (emailErr) {
+            console.error('[Webhook Email Dispatch Error]:', emailErr.message);
           }
-        } catch (emailErr) {
-          console.error('[Webhook Email Dispatch Error]:', emailErr.message);
+        }
+
+        // Asynchronously dispatch Meta Conversions API (CAPI) Purchase event
+        try {
+          const capiContext = {
+            clientIp: request.headers?.get ? request.headers.get('cf-connecting-ip') : null,
+            userAgent: request.headers?.get ? request.headers.get('user-agent') : null,
+            sourceUrl: `https://${(request.headers?.get ? request.headers.get('host') : null) || 'ebooks.trenzy.store'}/thank-you/?order_id=${encodeURIComponent(orderId)}`,
+            paidAt: authoritativeIso,
+            paidAtSource: 'webhook',
+            customFetch: env.customFetch
+          };
+          const capiPromise = sendCapiPurchaseEvent(orderId, env, capiContext);
+          if (typeof waitUntil === 'function') {
+            waitUntil(capiPromise);
+          } else if (typeof context !== 'undefined' && context && typeof context.waitUntil === 'function') {
+            context.waitUntil(capiPromise);
+          } else {
+            await capiPromise;
+          }
+        } catch (capiErr) {
+          console.error('[Webhook CAPI Dispatch Error]:', capiErr.message);
         }
       }
     } else if (eventType === 'payment.failed') {
@@ -143,14 +192,28 @@ export async function onRequestPost(context) {
       // 2. refund.created is deliberately excluded to prevent premature state changes
       const refundStatus = refundEntity?.status;
       const refundAmount = typeof refundEntity?.amount === 'number' ? refundEntity.amount : 0;
-      const expectedAmountPaise = parseInt(env.PRODUCT_PRICE || '149', 10) * 100;
       const paymentAmountRefunded = typeof paymentEntity?.amount_refunded === 'number'
         ? paymentEntity.amount_refunded
         : refundAmount;
 
       if (env.DB && (orderId || paymentId) && (!refundStatus || refundStatus === 'processed')) {
-        // Distinguish full refund from partial refund
-        const isFullRefund = paymentAmountRefunded >= expectedAmountPaise || refundAmount >= expectedAmountPaise;
+        // Query stored order to determine its actual original purchase amount from D1
+        let orderExpectedPaise = parseInt(env.PRODUCT_PRICE || '149', 10) * 100;
+        try {
+          const storedOrder = await env.DB.prepare(`
+            SELECT amount FROM orders
+            WHERE (razorpay_order_id = ? AND ? != '') OR (razorpay_payment_id = ? AND ? != '')
+          `).bind(orderId || '', orderId || '', paymentId || '', paymentId || '').first();
+
+          if (storedOrder && typeof storedOrder.amount === 'number' && storedOrder.amount > 0) {
+            orderExpectedPaise = storedOrder.amount * 100;
+          }
+        } catch (dbErr) {
+          console.warn('[D1 Refund Query Warning]:', dbErr.message);
+        }
+
+        // Distinguish full refund from partial refund based on the order's own original purchase amount
+        const isFullRefund = paymentAmountRefunded >= orderExpectedPaise || refundAmount >= orderExpectedPaise;
         const targetStatus = isFullRefund ? 'refunded' : 'partially_refunded';
 
         await env.DB.prepare(`

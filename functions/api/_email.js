@@ -16,17 +16,20 @@ export function escapeHtml(str) {
 /**
  * Generates plain-text and HTML email content for purchased e-book delivery
  */
-export function renderPurchaseEmail({ customerName, orderId, amount, currency, supportEmail } = {}) {
+export function renderPurchaseEmail({ customerName, orderId, amount, currency, supportEmail, downloadToken } = {}) {
   const safeName = customerName && customerName.trim() ? customerName.trim() : 'Valued Customer';
   const escapedName = escapeHtml(safeName);
   const safeOrderId = escapeHtml(orderId);
-  const safeAmount = escapeHtml(amount || '149');
+  const safeAmount = escapeHtml(amount || '1');
   const safeCurrency = escapeHtml(currency || 'INR');
   const safeSupportEmail = escapeHtml(supportEmail && supportEmail.trim() ? supportEmail.trim() : 'trenzy.helpme@gmail.com');
+  const downloadUrl = downloadToken
+    ? `https://ebooks.trenzy.store/thank-you/?order_id=${encodeURIComponent(orderId)}&token=${encodeURIComponent(downloadToken)}`
+    : null;
 
   const subject = 'Your Kids Drawing Book is Ready! Order Confirmation';
 
-  const text = [
+  const textLines = [
     `Hello ${safeName},`,
     '',
     `Thank you for purchasing Kids Drawing Book – Animals!`,
@@ -39,13 +42,27 @@ export function renderPurchaseEmail({ customerName, orderId, amount, currency, s
     `- Payment status: Successful`,
     `- Order ID: ${orderId}`,
     '',
-    `Your purchased PDF is attached to this email.`,
+    `Your purchased PDF is attached to this email.`
+  ];
+
+  if (downloadUrl) {
+    textLines.push(
+      '',
+      `You can also download your copy anytime online from:`,
+      downloadUrl
+    );
+  }
+
+  textLines.push(
+    '',
     `We hope you enjoy drawing and learning with the animals!`,
     '',
     `Regards,`,
     `Kids Drawing Book Team`,
     safeSupportEmail
-  ].join('\r\n');
+  );
+
+  const text = textLines.join('\r\n');
 
   const html = `<!DOCTYPE html>
 <html lang="en">
@@ -112,6 +129,14 @@ export function renderPurchaseEmail({ customerName, orderId, amount, currency, s
                   Filename: <code>Kids_Drawing_Book_Animals_School_Edition.pdf</code> (~1.2 MB)
                 </p>
               </div>
+              ${downloadUrl ? `
+              <!-- Online Download Button -->
+              <div style="text-align:center; margin:24px 0;">
+                <a href="${escapeHtml(downloadUrl)}" style="display:inline-block; background:linear-gradient(135deg, #FF914D 0%, #FF6B35 100%); color:#ffffff; font-weight:700; font-size:15px; padding:12px 24px; border-radius:8px; text-decoration:none; box-shadow:0 3px 8px rgba(255,107,53,0.35);">
+                  📥 Download PDF E-Book Online
+                </a>
+                <p style="margin:6px 0 0; font-size:12px; color:#888;">Instant direct download from your order page</p>
+              </div>` : ''}
 
               <p style="font-size:15px; margin:20px 0 24px;">We hope you enjoy drawing and learning with the animals!</p>
               
@@ -251,12 +276,13 @@ export async function sendSmtpEmail({
     }
   }
 
-  async function sendCommand(cmd, expectedCodes) {
+  async function sendCommand(cmd, expectedCodes, isSensitive = false) {
     await writer.write(encoder.encode(cmd + '\r\n'));
     const reply = await readReply();
     const validCodes = Array.isArray(expectedCodes) ? expectedCodes : [expectedCodes];
     if (!validCodes.includes(reply.code)) {
-      throw new Error(`SMTP command failed: [${cmd.split(' ')[0]}] returned ${reply.code} (expected ${validCodes.join('/')}): ${reply.message}`);
+      const sanitizedCmd = isSensitive ? 'AUTH_CREDENTIAL' : cmd.split(' ')[0];
+      throw new Error(`SMTP command failed: [${sanitizedCmd}] returned ${reply.code} (expected ${validCodes.join('/')}): ${reply.message}`);
     }
     return reply;
   }
@@ -273,8 +299,8 @@ export async function sendSmtpEmail({
 
     // 3. AUTH LOGIN
     await sendCommand('AUTH LOGIN', 334);
-    await sendCommand(btoa(cleanUser), 334);
-    await sendCommand(btoa(cleanPass), 235);
+    await sendCommand(btoa(cleanUser), 334, true);
+    await sendCommand(btoa(cleanPass), 235, true);
 
     // 4. Envelope MAIL FROM & RCPT TO
     await sendCommand(`MAIL FROM:<${from}>`, 250);
@@ -440,6 +466,86 @@ export function isPositivelyVerifiedPreview(env) {
 }
 
 /**
+ * Classifies the deployment environment for email dispatch safety.
+ *
+ * Requirements:
+ * A. Production precedence:
+ *    - Explicit production (production signals present, zero staging signals) takes precedence over all suppression flags.
+ *    - SUPPRESS_STAGING_EMAILS=true must NEVER suppress production email delivery.
+ * B. Fail-closed:
+ *    - Unknown, missing, or conflicting environment signals must NEVER allow automatic purchase email dispatch.
+ *    - Explicit staging must ALWAYS suppress purchase emails.
+ *    - Explicit production must ALWAYS preserve existing production email behavior.
+ */
+export function classifyEmailEnvironment(env) {
+  if (!env || typeof env !== 'object') {
+    return {
+      isExplicitProd: false,
+      isExplicitStaging: false,
+      isConflicting: false,
+      isUnknown: true,
+      shouldSuppressPurchaseDelivery: true,
+      reason: 'Environment bindings missing (fail-closed)'
+    };
+  }
+
+  const envName = (typeof env.ENVIRONMENT === 'string' ? env.ENVIRONMENT : '').trim().toLowerCase();
+  const nodeEnv = (typeof env.NODE_ENV === 'string' ? env.NODE_ENV : '').trim().toLowerCase();
+  const pagesBranch = (typeof env.CF_PAGES_BRANCH === 'string' ? env.CF_PAGES_BRANCH : '').trim().toLowerCase();
+  const testTargetEnv = (typeof env.TEST_TARGET_ENV === 'string' ? env.TEST_TARGET_ENV : '').trim().toLowerCase();
+
+  const isProdSignal = pagesBranch === 'main' || pagesBranch === 'master' || envName === 'production' || nodeEnv === 'production' || testTargetEnv === 'production';
+  const isStagingSignal = pagesBranch === 'staging' || envName === 'staging' || envName === 'preview' || nodeEnv === 'staging' || testTargetEnv === 'staging';
+
+  // 1. Conflicting signals: Both production and staging signals present -> fail-closed (suppress)
+  if (isProdSignal && isStagingSignal) {
+    return {
+      isExplicitProd: false,
+      isExplicitStaging: false,
+      isConflicting: true,
+      isUnknown: false,
+      shouldSuppressPurchaseDelivery: true,
+      reason: 'Conflicting environment signals detected (fail-closed)'
+    };
+  }
+
+  // 2. Explicit production: Production signal present and zero staging signal
+  if (isProdSignal && !isStagingSignal) {
+    // Production precedence: SUPPRESS_STAGING_EMAILS never suppresses production
+    return {
+      isExplicitProd: true,
+      isExplicitStaging: false,
+      isConflicting: false,
+      isUnknown: false,
+      shouldSuppressPurchaseDelivery: false,
+      reason: 'Explicit production environment'
+    };
+  }
+
+  // 3. Explicit staging: Staging signal present and zero production signal
+  if (isStagingSignal && !isProdSignal) {
+    return {
+      isExplicitProd: false,
+      isExplicitStaging: true,
+      isConflicting: false,
+      isUnknown: false,
+      shouldSuppressPurchaseDelivery: true,
+      reason: 'Explicit staging environment'
+    };
+  }
+
+  // 4. Unknown/missing signals: Neither production nor staging signal present -> fail-closed (suppress)
+  return {
+    isExplicitProd: false,
+    isExplicitStaging: false,
+    isConflicting: false,
+    isUnknown: true,
+    shouldSuppressPurchaseDelivery: true,
+    reason: 'Unknown or missing environment signals (fail-closed)'
+  };
+}
+
+/**
  * Idempotent post-purchase email processor using Cloudflare D1 email_outbox table
  */
 export async function processOrderEmail(orderId, env, options = {}) {
@@ -502,6 +608,22 @@ export async function processOrderEmail(orderId, env, options = {}) {
   if (!order.customer_email || !order.customer_email.includes('@')) {
     console.error(`[Email Outbox]: Invalid customer email for order ${order.id}: ${order.customer_email}`);
     return { success: false, status: 'invalid_email' };
+  }
+
+  // Gate 3: Staging & Non-Production Email Suppression Safeguard
+  // In staging, preview, unknown, or conflicting environments, automatic purchase_delivery email dispatch
+  // is suppressed to guarantee customer safety and prevent unintended email dispatch.
+  // Production environment detection takes precedence over all suppression flags.
+  // customTransport is never permitted to bypass staging suppression for purchase_delivery.
+  const envCheck = classifyEmailEnvironment(env);
+  if (emailType === 'purchase_delivery' && envCheck.shouldSuppressPurchaseDelivery) {
+    console.info(`[Email Outbox]: Staging email suppression active for order ${order.id}. Skipping automatic email dispatch (${envCheck.reason}).`);
+    return {
+      success: true,
+      status: 'staging_suppressed',
+      reason: envCheck.reason,
+      message: `Automatic purchase email dispatch suppressed: ${envCheck.reason}.`
+    };
   }
 
   const outboxId = `out_${order.id}_${emailType}`;
@@ -583,16 +705,18 @@ export async function processOrderEmail(orderId, env, options = {}) {
     const attachment = activeAttachment || (await fetchPdfFromS3(env));
 
     const supportEmail = (env.SUPPORT_EMAIL || 'trenzy.helpme@gmail.com').trim();
+    const configuredPrice = env.PRODUCT_PRICE || '1';
     const displayAmount = (order.amount && Number(order.amount) >= 1000)
       ? (Number(order.amount) / 100).toFixed(0)
-      : String(order.amount || '149');
+      : String(order.amount || configuredPrice);
 
     const { text, html, subject } = renderPurchaseEmail({
       customerName: order.customer_name || 'Valued Customer',
       orderId: order.id,
       amount: displayAmount,
       currency: order.currency || 'INR',
-      supportEmail
+      supportEmail,
+      downloadToken: order.download_token
     });
 
     const sendResult = await sendSmtpEmail({

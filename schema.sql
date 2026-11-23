@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS orders (
   status TEXT NOT NULL DEFAULT 'created', -- 'created', 'paid', 'failed'
   download_token TEXT UNIQUE,
   download_count INTEGER NOT NULL DEFAULT 0,
+  paid_at TEXT,
+  paid_at_source TEXT, -- 'webhook' (authoritative capture event), 'verify_approx' (verification fallback)
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -50,3 +52,23 @@ CREATE TABLE IF NOT EXISTS email_outbox (
 
 CREATE INDEX IF NOT EXISTS idx_email_outbox_status ON email_outbox(status);
 CREATE INDEX IF NOT EXISTS idx_email_outbox_order ON email_outbox(order_id);
+
+-- Table: capi_events (For Meta Conversions API Server-Side Tracking & Idempotency)
+CREATE TABLE IF NOT EXISTS capi_events (
+  id TEXT PRIMARY KEY,
+  order_id TEXT NOT NULL,
+  event_name TEXT NOT NULL DEFAULT 'Purchase',
+  status TEXT NOT NULL DEFAULT 'pending', -- 'pending', 'sending', 'sent', 'failed'
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at TEXT,
+  sent_at TEXT,
+  meta_event_id TEXT,
+  fbtrace_id TEXT,
+  error_message TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (order_id, event_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_capi_events_status ON capi_events(status);
+CREATE INDEX IF NOT EXISTS idx_capi_events_order ON capi_events(order_id);
