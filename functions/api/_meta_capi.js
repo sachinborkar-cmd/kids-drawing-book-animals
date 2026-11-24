@@ -136,7 +136,7 @@ export async function buildCapiPurchasePayload(order, env, requestContext = {}) 
   // 2. Custom Data (Transaction and Product Metadata)
   const finalAmount = (typeof order.amount === 'number' && order.amount > 0)
     ? order.amount
-    : parseInt(env.PRODUCT_PRICE || '1', 10);
+    : parseInt(env.PRODUCT_PRICE || '149', 10);
   const finalCurrency = order.currency || env.PRODUCT_CURRENCY || 'INR';
 
   const customData = {

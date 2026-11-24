@@ -705,7 +705,7 @@ export async function processOrderEmail(orderId, env, options = {}) {
     const attachment = activeAttachment || (await fetchPdfFromS3(env));
 
     const supportEmail = (env.SUPPORT_EMAIL || 'trenzy.helpme@gmail.com').trim();
-    const configuredPrice = env.PRODUCT_PRICE || '1';
+    const configuredPrice = env.PRODUCT_PRICE || '149';
     const displayAmount = (order.amount && Number(order.amount) >= 1000)
       ? (Number(order.amount) / 100).toFixed(0)
       : String(order.amount || configuredPrice);
