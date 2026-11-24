@@ -36,3 +36,7 @@ Thumbs.db
 *.pdf
 scripts/upload_to_s3.js
 
+# Database backups (keep strictly local and private)
+backup*.sql
+*.backup.toml
+

@@ -26,24 +26,44 @@ document.addEventListener('DOMContentLoaded', async function() {
     orderIdDisplay.textContent = orderId;
   }
 
-  // Idempotent Purchase Event Tracking on Thank You Page
-  if (window.Analytics && orderId) {
-    window.Analytics.trackPurchase(
-      orderId,
-      window.PRODUCT_CONFIG?.pricing.price || 149,
-      window.PRODUCT_CONFIG?.pricing.currency || 'INR'
-    );
-  }
-
   // Request fresh S3 presigned URL
   try {
     if (statusWrap) statusWrap.textContent = 'Generating your secure download link...';
 
     const res = await fetch(`/api/download?order_id=${encodeURIComponent(orderId)}&token=${encodeURIComponent(token)}`);
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
 
-    if (!res.ok || !data.success || !data.download_url) {
-      throw new Error(data.error || 'Your download token is invalid or expired.');
+    // Requirement 2: Do not treat HTTP 200 alone as proof of successful purchase
+    if (!res.ok || !data || data.success !== true || !data.download_url) {
+      throw new Error(data?.error || 'Your download token is invalid or expired.');
+    }
+
+    // Requirement 1: Validate complete /api/download response before firing Purchase:
+    // - data.success === true (verified above)
+    // - Valid order_id string
+    // - data.status === 'paid' (server-confirmed paid order)
+    // - Positive verified amount (data.amount > 0)
+    // - currency === 'INR'
+    const verifiedOrderId = typeof data.order_id === 'string' && data.order_id.trim().length > 0 ? data.order_id.trim() : null;
+    const isPaidStatus = data.status === 'paid';
+    const isPositiveAmount = typeof data.amount === 'number' && data.amount > 0;
+    const isCorrectCurrency = data.currency === 'INR';
+
+    if (verifiedOrderId && isPaidStatus && isPositiveAmount && isCorrectCurrency) {
+      if (window.Analytics && typeof window.Analytics.trackPurchase === 'function') {
+        window.Analytics.trackPurchase(
+          verifiedOrderId,
+          data.amount,
+          data.currency
+        );
+      }
+    } else {
+      console.warn('[ThankYou]: Complete purchase authorization criteria not satisfied. Skipping purchase event.', {
+        hasValidOrderId: !!verifiedOrderId,
+        isPaidStatus,
+        isPositiveAmount,
+        isCorrectCurrency
+      });
     }
 
     // Success: Activate download button

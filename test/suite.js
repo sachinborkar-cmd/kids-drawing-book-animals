@@ -30,6 +30,7 @@ import {
 } from '../functions/api/_aws_s3.js';
 import {
   processOrderEmail,
+  classifyEmailEnvironment,
   fetchPdfFromS3,
   renderPurchaseEmail,
   escapeHtml,
@@ -38,6 +39,17 @@ import {
   EXPECTED_STAGING_BUCKET,
   EXPECTED_STAGING_RAZORPAY_KEY
 } from '../functions/api/_email.js';
+import {
+  sendCapiPurchaseEvent,
+  buildCapiPurchasePayload,
+  parseUtcToUnixSeconds,
+  sha256Hex,
+  hashPhone,
+  hashCustomerNames,
+  sanitizeErrorMessage,
+  META_PIXEL_ID_DEFAULT,
+  META_GRAPH_API_VERSION_DEFAULT
+} from '../functions/api/_meta_capi.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -49,6 +61,7 @@ class MockD1 {
     this.orders = new Map();
     this.webhooks = new Map();
     this.outbox = new Map();
+    this.capi_events = new Map();
   }
 
   prepare(query) {
@@ -58,6 +71,14 @@ class MockD1 {
         run: async () => {
           if (q.startsWith('INSERT INTO orders')) {
             const [id, rzp_order_id, name, email, phone, amount, currency, status] = args;
+            // Enforce SQLite PRIMARY KEY (id) and UNIQUE (razorpay_order_id) constraints
+            const existingWithId = Array.from(this.orders.values()).find(o => o.id === id);
+            if (existingWithId) {
+              throw new Error('UNIQUE constraint failed: orders.id');
+            }
+            if (this.orders.has(rzp_order_id)) {
+              throw new Error('UNIQUE constraint failed: orders.razorpay_order_id');
+            }
             this.orders.set(rzp_order_id, {
               id,
               razorpay_order_id: rzp_order_id,
@@ -68,11 +89,50 @@ class MockD1 {
               currency,
               status: status || 'created',
               download_token: null,
-              download_count: 0
+              download_count: 0,
+              paid_at: null,
+              paid_at_source: null
             });
             return { success: true };
           }
           if (q.startsWith('UPDATE orders') && q.includes("status = 'paid'")) {
+            if (q.includes("razorpay_signature = ?")) {
+              let payment_id, signature, token, approxIso, rzp_order_id, targetOrderId;
+              if (args.length === 6) {
+                [payment_id, signature, token, approxIso, rzp_order_id, targetOrderId] = args;
+              } else {
+                [payment_id, signature, token, rzp_order_id, targetOrderId] = args;
+              }
+              const rec = this.orders.get(rzp_order_id) || Array.from(this.orders.values()).find(o => o.id === rzp_order_id || o.id === targetOrderId || o.razorpay_order_id === rzp_order_id || o.razorpay_order_id === targetOrderId);
+              if (rec) {
+                rec.status = 'paid';
+                rec.razorpay_payment_id = payment_id;
+                rec.razorpay_signature = signature;
+                rec.download_token = rec.download_token || token;
+                if (approxIso && rec.paid_at_source !== 'webhook' && !rec.paid_at) {
+                  rec.paid_at = approxIso;
+                  rec.paid_at_source = 'verify_approx';
+                }
+              }
+              return { success: true };
+            }
+            if (q.includes("paid_at_source = 'webhook'") || (q.includes("download_token = COALESCE(download_token, ?)") && args.length === 6)) {
+              const [payment_id, token, authIso1, authIso2, authIso3, rzp_order_id] = args;
+              const rec = this.orders.get(rzp_order_id) || Array.from(this.orders.values()).find(o => o.id === rzp_order_id || o.razorpay_order_id === rzp_order_id);
+              if (rec) {
+                rec.status = 'paid';
+                rec.razorpay_payment_id = rec.razorpay_payment_id || payment_id;
+                rec.download_token = rec.download_token || token;
+                if (!rec.paid_at || rec.paid_at_source !== 'webhook') {
+                  rec.paid_at = authIso1;
+                  rec.paid_at_source = 'webhook';
+                } else if (authIso2 > rec.paid_at) {
+                  rec.paid_at = authIso3;
+                  rec.paid_at_source = 'webhook';
+                }
+              }
+              return { success: true };
+            }
             if (args.length === 3) {
               const [payment_id, token, rzp_order_id] = args;
               const rec = this.orders.get(rzp_order_id) || Array.from(this.orders.values()).find(o => o.id === rzp_order_id);
@@ -80,6 +140,29 @@ class MockD1 {
                 rec.status = 'paid';
                 rec.razorpay_payment_id = rec.razorpay_payment_id || payment_id;
                 rec.download_token = rec.download_token || token;
+              }
+              return { success: true };
+            }
+            if (args.length === 4) {
+              const [payment_id, token, paid_at, rzp_order_id] = args;
+              const rec = this.orders.get(rzp_order_id) || Array.from(this.orders.values()).find(o => o.id === rzp_order_id);
+              if (rec) {
+                rec.status = 'paid';
+                rec.razorpay_payment_id = rec.razorpay_payment_id || payment_id;
+                rec.download_token = rec.download_token || token;
+                rec.paid_at = rec.paid_at || paid_at;
+              }
+              return { success: true };
+            }
+            if (args.length === 6) {
+              const [payment_id, signature, token, paid_at, rzp_order_id, targetOrderId] = args;
+              const rec = this.orders.get(rzp_order_id) || Array.from(this.orders.values()).find(o => o.id === rzp_order_id || o.id === targetOrderId);
+              if (rec) {
+                rec.status = 'paid';
+                rec.razorpay_payment_id = payment_id;
+                rec.razorpay_signature = signature;
+                rec.download_token = token;
+                rec.paid_at = rec.paid_at || paid_at;
               }
               return { success: true };
             }
@@ -91,6 +174,9 @@ class MockD1 {
               rec.razorpay_signature = signature;
               rec.download_token = token;
             }
+            return { success: true };
+          }
+          if (q.startsWith('ALTER TABLE orders ADD COLUMN')) {
             return { success: true };
           }
           if (q.startsWith('UPDATE orders') && q.includes("status = 'failed'")) {
@@ -151,6 +237,73 @@ class MockD1 {
             });
             return { success: true, meta: { changes: 1 } };
           }
+          if (q.startsWith('INSERT INTO capi_events')) {
+            let id, order_id, meta_event_id;
+            if (args.length === 3) {
+              [id, order_id, meta_event_id] = args;
+            } else {
+              id = args[0];
+              order_id = args[1];
+              meta_event_id = args[args.length - 1];
+            }
+            const key = `${order_id}_Purchase`;
+            if (this.capi_events.has(key)) {
+              throw new Error('UNIQUE constraint failed: capi_events.order_id, capi_events.event_name');
+            }
+            this.capi_events.set(key, {
+              id,
+              order_id,
+              event_name: 'Purchase',
+              status: 'pending',
+              attempts: 0,
+              last_attempt_at: null,
+              sent_at: null,
+              meta_event_id: meta_event_id || order_id,
+              fbtrace_id: null,
+              error_message: null
+            });
+            return { success: true, meta: { changes: 1 } };
+          }
+          if (q.startsWith('UPDATE capi_events') && q.includes("status = 'sending'")) {
+            const [order_id] = args;
+            const key = `${order_id}_Purchase`;
+            const rec = this.capi_events.get(key);
+            const isStale = rec && rec.status === 'sending' && rec.last_attempt_at && (Date.now() - new Date(rec.last_attempt_at).getTime() > 5 * 60 * 1000);
+            if (rec && (rec.status === 'pending' || rec.status === 'failed' || isStale) && rec.attempts < 3) {
+              rec.status = 'sending';
+              rec.attempts++;
+              rec.last_attempt_at = new Date().toISOString();
+              return { success: true, meta: { changes: 1 } };
+            }
+            return { success: true, meta: { changes: 0 } };
+          }
+          if (q.startsWith('UPDATE capi_events') && q.includes("status = 'sent'")) {
+            const [fbtrace_id, order_id] = args;
+            const key = `${order_id}_Purchase`;
+            const rec = this.capi_events.get(key);
+            if (rec) {
+              rec.status = 'sent';
+              rec.sent_at = new Date().toISOString();
+              rec.fbtrace_id = fbtrace_id || null;
+              rec.error_message = null;
+              return { success: true, meta: { changes: 1 } };
+            }
+            return { success: true, meta: { changes: 0 } };
+          }
+          if (q.startsWith('UPDATE capi_events') && q.includes("status = 'failed'")) {
+            const err_msg = args[0];
+            const order_id = args[args.length - 1];
+            const fbtrace_id = args.length > 2 ? args[1] : null;
+            const key = `${order_id}_Purchase`;
+            const rec = this.capi_events.get(key);
+            if (rec) {
+              rec.status = 'failed';
+              rec.error_message = err_msg;
+              if (fbtrace_id) rec.fbtrace_id = fbtrace_id;
+              return { success: true, meta: { changes: 1 } };
+            }
+            return { success: true, meta: { changes: 0 } };
+          }
           if (q.startsWith('UPDATE email_outbox') && q.includes("status = 'processing'")) {
             const [order_id, email_type] = args;
             const key = `${order_id}_${email_type}`;
@@ -191,12 +344,14 @@ class MockD1 {
         },
         first: async () => {
           if (q.includes('FROM orders')) {
-            const [orderId, rzpId, token] = args;
-            if (token !== undefined) {
+            if (q.includes('download_token = ?')) {
+              const [orderId, rzpId, token] = args;
               const rec = Array.from(this.orders.values()).find(o => (o.id === orderId || o.razorpay_order_id === orderId) && o.download_token === token);
               return rec || null;
             }
-            const rec = Array.from(this.orders.values()).find(o => o.id === orderId || o.razorpay_order_id === orderId || o.id === rzpId || o.razorpay_order_id === rzpId);
+            const rec = Array.from(this.orders.values()).find(o =>
+              args.some(arg => arg && (o.id === arg || o.razorpay_order_id === arg || o.razorpay_payment_id === arg))
+            );
             return rec || null;
           }
           if (q.includes('FROM webhook_logs')) {
@@ -207,6 +362,11 @@ class MockD1 {
             const [order_id, email_type] = args;
             const key = `${order_id}_${email_type}`;
             return this.outbox.get(key) || null;
+          }
+          if (q.includes('FROM capi_events')) {
+            const [order_id] = args;
+            const key = `${order_id}_Purchase`;
+            return this.capi_events.get(key) || null;
           }
           return null;
         }
@@ -282,7 +442,46 @@ globalThis.fetch = async (url, options = {}) => {
         amount: amount,
         currency: currency,
         status: status,
-        order_id: orderId
+        order_id: orderId,
+        created_at: globalThis.__mockPaymentCreatedAt !== undefined ? globalThis.__mockPaymentCreatedAt : 1732103456
+      })
+    };
+  }
+
+  if (urlStr.includes('graph.facebook.com')) {
+    if (globalThis.__mockMetaNetworkError) {
+      throw new Error('Meta network connection reset simulation');
+    }
+    if (globalThis.__mockMetaApiError) {
+      return {
+        ok: false,
+        status: 400,
+        statusText: 'Bad Request',
+        json: async () => ({
+          error: {
+            message: 'Invalid parameter in Meta CAPI payload simulation',
+            type: 'OAuthException',
+            code: 100,
+            fbtrace_id: 'tr_mock_err_999'
+          }
+        })
+      };
+    }
+    globalThis.__lastMetaCapiCall = {
+      url: urlStr,
+      options,
+      body: options.body ? JSON.parse(options.body) : null
+    };
+    if (!globalThis.__metaCapiCallCount) globalThis.__metaCapiCallCount = 0;
+    globalThis.__metaCapiCallCount++;
+    return {
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      json: async () => ({
+        events_received: 1,
+        fbtrace_id: 'tr_mock_success_123',
+        messages: []
       })
     };
   }
@@ -297,6 +496,8 @@ const mockEnv = {
   ENVIRONMENT: 'production',
   PRODUCT_PRICE: '149',
   PRODUCT_CURRENCY: 'INR',
+  META_CAPI_ACCESS_TOKEN: 'MOCK_CAPI_TEST_ACCESS_TOKEN_123',
+  META_PIXEL_ID: '3370053963196277',
   RAZORPAY_KEY_ID: 'rzp_live_test_genuine_key_123',
   RAZORPAY_KEY_SECRET: 'test_secret_key_123',
   RAZORPAY_WEBHOOK_SECRET: 'webhook_secret_xyz',
@@ -458,6 +659,101 @@ await test('POST /api/create-order phone validation (optional & exact 10 digits)
     env: mockEnv
   });
   assert.equal(resSpace.status, 400, 'Phone with spaces must be rejected with 400');
+});
+
+await test('POST /api/create-order generates collision-resistant unique order IDs under rapid concurrent creation', async () => {
+  const concurrentCount = 10;
+  const requests = Array.from({ length: concurrentCount }, (_, i) => ({
+    request: { json: async () => ({ name: `Concurrent User ${i}`, email: `user${i}@example.com` }) },
+    env: mockEnv
+  }));
+
+  const responses = await Promise.all(requests.map(req => handleCreateOrder(req)));
+  const orderIds = [];
+
+  for (const res of responses) {
+    assert.equal(res.status, 200);
+    const data = JSON.parse(await res.text());
+    assert(data.order_id.startsWith('ord_'), 'Order ID must preserve ord_ prefix');
+    orderIds.push(data.order_id);
+  }
+
+  const uniqueIds = new Set(orderIds);
+  assert.equal(uniqueIds.size, concurrentCount, 'All concurrent order IDs must be strictly unique');
+});
+
+await test('POST /api/create-order fails closed if D1 database insertion fails', async () => {
+  const failingDbEnv = {
+    ...mockEnv,
+    DB: {
+      prepare: () => ({
+        bind: () => ({
+          run: async () => {
+            throw new Error('D1 storage connection failure simulation');
+          }
+        })
+      })
+    }
+  };
+
+  const res = await handleCreateOrder({
+    request: { json: async () => ({ name: 'Failure Test', email: 'fail@example.com' }) },
+    env: failingDbEnv
+  });
+
+  assert.equal(res.status, 500, 'Must return HTTP 500 if database persistence fails');
+  const data = JSON.parse(await res.text());
+  assert.equal(data.success, false, 'Success must be false on persistence failure');
+});
+
+await test('POST /api/create-order fails closed (HTTP 500) if env.DB is missing in production or staging', async () => {
+  const noDbProdEnv = {
+    ...mockEnv,
+    DB: undefined
+  };
+
+  const resProd = await handleCreateOrder({
+    request: { json: async () => ({ name: 'No DB User', email: 'nodb@example.com' }) },
+    env: noDbProdEnv
+  });
+
+  assert.equal(resProd.status, 500, 'Must return HTTP 500 when env.DB is missing in production');
+  const prodData = JSON.parse(await resProd.text());
+  assert.equal(prodData.success, false);
+
+  const noDbStagingEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'staging',
+    ENVIRONMENT: 'staging',
+    DB: undefined
+  };
+
+  const resStaging = await handleCreateOrder({
+    request: { json: async () => ({ name: 'No DB User', email: 'nodb@example.com' }) },
+    env: noDbStagingEnv
+  });
+
+  assert.equal(resStaging.status, 500, 'Must return HTTP 500 when env.DB is missing in staging');
+  const stagingData = JSON.parse(await resStaging.text());
+  assert.equal(stagingData.success, false);
+});
+
+await test('POST /api/create-order fails closed (HTTP 500) if crypto.randomUUID is unavailable', async () => {
+  const origRandomUUID = globalThis.crypto?.randomUUID;
+  try {
+    globalThis.crypto.randomUUID = undefined;
+    const res = await handleCreateOrder({
+      request: { json: async () => ({ name: 'No Crypto User', email: 'nocrypto@example.com' }) },
+      env: mockEnv
+    });
+    assert.equal(res.status, 500, 'Must return HTTP 500 if crypto.randomUUID is unavailable');
+    const data = JSON.parse(await res.text());
+    assert.equal(data.success, false);
+  } finally {
+    if (origRandomUUID) {
+      globalThis.crypto.randomUUID = origRandomUUID;
+    }
+  }
 });
 
 // 3. RAZORPAY SECURITY & SIGNATURE AUDIT
@@ -1527,6 +1823,16 @@ await test('The two outbox records (purchase_delivery and staging_compressed_tes
     download_token: dualToken
   });
 
+  const prodTransportEnv = {
+    ...mockEnv,
+    customTransport: mockTransportSuccess,
+    attachmentOverride: {
+      buffer: mockPdfBuffer,
+      filename: 'Kids_Drawing_Book_Animals_School_Edition.pdf',
+      contentType: 'application/pdf'
+    }
+  };
+
   const testEnv = {
     ...previewTestEnv,
     customTransport: mockTransportSuccess,
@@ -1538,7 +1844,7 @@ await test('The two outbox records (purchase_delivery and staging_compressed_tes
   };
 
   // Step 1: Send initial purchase_delivery email (e.g. historical purchase)
-  const res1 = await processOrderEmail(dualOrderId, testEnv, {
+  const res1 = await processOrderEmail(dualOrderId, prodTransportEnv, {
     emailType: 'purchase_delivery'
   });
   assert.equal(res1.success, true);
@@ -2632,6 +2938,2015 @@ await test('Payment failed webhook does NOT override already paid order status',
   });
   assert.equal(res.status, 200);
   assert.equal(mockDb.orders.get(rzpId).status, 'paid', 'Order status must remain paid despite payment.failed');
+});
+
+// 10. CHECKOUT UX IMPROVEMENTS & TEMPORARY ₹1 TESTING PRICE AUDIT
+console.log('\n[Audit Test 10: Checkout Improvements & ₹1 Testing Price]');
+
+await test('HTML checkout form contains Confirm Email and excludes Phone input', async () => {
+  const html = fs.readFileSync(path.join(ROOT_DIR, 'client/ebook/index.html'), 'utf8');
+  assert(html.includes('id="cust-email"'), 'Missing cust-email input');
+  assert(html.includes('id="cust-email-confirm"'), 'Missing cust-email-confirm input');
+  assert(!html.includes('id="cust-phone"'), 'Form must not contain cust-phone input');
+  assert(html.includes('Confirm Email Address'), 'Missing Confirm Email Address label');
+});
+
+await test('Frontend validation logic: Matching email addresses succeed', async () => {
+  const validateEmails = (email, confirm) => {
+    const e = (email || '').trim();
+    const c = (confirm || '').trim();
+    if (!e || !e.includes('@')) return { valid: false, error: 'Please enter a valid email address.' };
+    if (!c) return { valid: false, error: 'Please confirm your email address.' };
+    if (e.toLowerCase() !== c.toLowerCase()) return { valid: false, error: 'Email addresses do not match. Please verify both fields.' };
+    return { valid: true, email: e.toLowerCase() };
+  };
+
+  const r1 = validateEmails('Priya.Sharma@example.com ', '  priya.sharma@EXAMPLE.com');
+  assert.equal(r1.valid, true);
+  assert.equal(r1.email, 'priya.sharma@example.com');
+});
+
+await test('Frontend validation logic: Mismatched, missing, and invalid emails rejected', async () => {
+  const validateEmails = (email, confirm) => {
+    const e = (email || '').trim();
+    const c = (confirm || '').trim();
+    if (!e || !e.includes('@')) return { valid: false, error: 'Please enter a valid email address.' };
+    if (!c) return { valid: false, error: 'Please confirm your email address.' };
+    if (e.toLowerCase() !== c.toLowerCase()) return { valid: false, error: 'Email addresses do not match. Please verify both fields.' };
+    return { valid: true, email: e.toLowerCase() };
+  };
+
+  const rMismatch = validateEmails('priya@example.com', 'priya2@example.com');
+  assert.equal(rMismatch.valid, false);
+  assert.equal(rMismatch.error, 'Email addresses do not match. Please verify both fields.');
+
+  const rMissingConfirm = validateEmails('priya@example.com', '');
+  assert.equal(rMissingConfirm.valid, false);
+  assert.equal(rMissingConfirm.error, 'Please confirm your email address.');
+
+  const rInvalid = validateEmails('priyaexample.com', 'priyaexample.com');
+  assert.equal(rInvalid.valid, false);
+  assert.equal(rInvalid.error, 'Please enter a valid email address.');
+});
+
+await test('Checkout without phone number creates order with empty phone string', async () => {
+  const req = {
+    json: async () => ({ name: 'Anita Rao', email: 'anita@example.com' })
+  };
+  const res = await handleCreateOrder({ request: req, env: mockEnv });
+  assert.equal(res.status, 200);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.customer.phone, '');
+  const storedOrder = mockEnv.DB.orders.get(data.razorpay_order_id);
+  assert.equal(storedOrder.customer_phone, '');
+});
+
+await test('₹1 order creation in Staging Test Mode returns 100 paise', async () => {
+  const stagingTestEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'staging',
+    ENVIRONMENT: 'staging',
+    PRODUCT_PRICE: '1',
+    RAZORPAY_KEY_ID: EXPECTED_STAGING_RAZORPAY_KEY
+  };
+
+  const configRes = await handleConfig({ env: stagingTestEnv });
+  const configData = JSON.parse(await configRes.text());
+  assert.equal(configData.product.price, 1);
+  assert.equal(configData.product.formattedPrice, '₹1');
+
+  const orderReq = {
+    json: async () => ({ name: 'Test User', email: 'test1inr@example.com' })
+  };
+  const orderRes = await handleCreateOrder({ request: orderReq, env: stagingTestEnv });
+  assert.equal(orderRes.status, 200);
+  const orderData = JSON.parse(await orderRes.text());
+  assert.equal(orderData.amount, 100, 'Razorpay amount must be 100 paise for ₹1');
+  const dbOrder = mockEnv.DB.orders.get(orderData.razorpay_order_id);
+  assert.equal(dbOrder.amount, 1, 'D1 order record must store amount in Rupees (1)');
+});
+
+await test('Payment verification for 100 paise succeeds and marks order paid', async () => {
+  const stagingTestEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'staging',
+    ENVIRONMENT: 'staging',
+    PRODUCT_PRICE: '1',
+    RAZORPAY_KEY_ID: EXPECTED_STAGING_RAZORPAY_KEY
+  };
+
+  const orderReq = {
+    json: async () => ({ name: 'Pay Verify User', email: 'verify1inr@example.com' })
+  };
+  const orderRes = await handleCreateOrder({ request: orderReq, env: stagingTestEnv });
+  const orderData = JSON.parse(await orderRes.text());
+
+  const rzpOrderId = orderData.razorpay_order_id;
+  const payId = `pay_1inr_${Date.now()}`;
+  const validSig = await computeWebhookSig(`${rzpOrderId}|${payId}`, stagingTestEnv.RAZORPAY_KEY_SECRET);
+
+  globalThis.__mockPaymentId = payId;
+  globalThis.__mockPaymentStatus = 'captured';
+  globalThis.__mockPaymentAmount = 100; // 100 paise
+  globalThis.__mockPaymentCurrency = 'INR';
+  globalThis.__mockPaymentOrderId = rzpOrderId;
+
+  const verifyRes = await handleVerifyPayment({
+    request: {
+      json: async () => ({
+        order_id: orderData.order_id,
+        razorpay_order_id: rzpOrderId,
+        razorpay_payment_id: payId,
+        razorpay_signature: validSig,
+        email: 'verify1inr@example.com'
+      })
+    },
+    env: stagingTestEnv,
+    waitUntil: () => {}
+  });
+
+  assert.equal(verifyRes.status, 200);
+  const verifyData = JSON.parse(await verifyRes.text());
+  assert.equal(verifyData.success, true);
+  assert(verifyData.download_token, 'Download token must be issued');
+
+  const storedOrder = mockEnv.DB.orders.get(rzpOrderId);
+  assert.equal(storedOrder.status, 'paid');
+});
+
+await test('Payment verification rejects amount mismatch when expecting 100 paise', async () => {
+  const stagingTestEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'staging',
+    ENVIRONMENT: 'staging',
+    PRODUCT_PRICE: '1',
+    RAZORPAY_KEY_ID: EXPECTED_STAGING_RAZORPAY_KEY
+  };
+
+  const rzpOrderId = `order_mismatch_${Date.now()}`;
+  mockDb.orders.set(rzpOrderId, {
+    id: `ord_mismatch_${Date.now()}`,
+    razorpay_order_id: rzpOrderId,
+    customer_email: 'mismatch@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'created'
+  });
+
+  const payId = 'pay_bad_paise';
+  const validSig = await computeWebhookSig(`${rzpOrderId}|${payId}`, stagingTestEnv.RAZORPAY_KEY_SECRET);
+
+  globalThis.__mockPaymentId = payId;
+  globalThis.__mockPaymentStatus = 'captured';
+  globalThis.__mockPaymentAmount = 14900; // 14900 paise instead of 100 paise
+  globalThis.__mockPaymentCurrency = 'INR';
+  globalThis.__mockPaymentOrderId = rzpOrderId;
+
+  const verifyRes = await handleVerifyPayment({
+    request: {
+      json: async () => ({
+        order_id: mockDb.orders.get(rzpOrderId).id,
+        razorpay_order_id: rzpOrderId,
+        razorpay_payment_id: payId,
+        razorpay_signature: validSig,
+        email: 'mismatch@example.com'
+      })
+    },
+    env: stagingTestEnv,
+    waitUntil: () => {}
+  });
+
+  assert.equal(verifyRes.status, 400);
+  const data = JSON.parse(await verifyRes.text());
+  assert(data.error.includes('Payment amount mismatch'));
+  delete globalThis.__mockPaymentId;
+  delete globalThis.__mockPaymentStatus;
+  delete globalThis.__mockPaymentAmount;
+  delete globalThis.__mockPaymentCurrency;
+  delete globalThis.__mockPaymentOrderId;
+});
+
+await test('Existing ₹149 orders remain unaffected and preserve download token under ₹1 price config', async () => {
+  const stagingTestEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'staging',
+    ENVIRONMENT: 'staging',
+    PRODUCT_PRICE: '1',
+    RAZORPAY_KEY_ID: EXPECTED_STAGING_RAZORPAY_KEY
+  };
+
+  const oldRzpId = 'order_existing_149_paid';
+  const oldLocalId = 'ord_existing_149_paid';
+  const oldToken = 'tok_existing_149_valid_token_xyz';
+
+  mockDb.orders.set(oldRzpId, {
+    id: oldLocalId,
+    razorpay_order_id: oldRzpId,
+    razorpay_payment_id: 'pay_existing_149',
+    customer_email: 'customer149@example.com',
+    amount: 149, // Existing ₹149 order
+    currency: 'INR',
+    status: 'paid',
+    download_token: oldToken
+  });
+
+  const sig = await computeWebhookSig(`${oldRzpId}|pay_existing_149`, stagingTestEnv.RAZORPAY_KEY_SECRET);
+
+  // Re-verification of existing paid order must succeed and preserve token despite PRODUCT_PRICE = '1'
+  const verifyRes = await handleVerifyPayment({
+    request: {
+      json: async () => ({
+        order_id: oldLocalId,
+        razorpay_order_id: oldRzpId,
+        razorpay_payment_id: 'pay_existing_149',
+        razorpay_signature: sig,
+        email: 'customer149@example.com'
+      })
+    },
+    env: stagingTestEnv,
+    waitUntil: () => {}
+  });
+
+  assert.equal(verifyRes.status, 200);
+  const verifyData = JSON.parse(await verifyRes.text());
+  assert.equal(verifyData.success, true);
+  assert.equal(verifyData.download_token, oldToken);
+  assert(verifyData.redirect_url.includes(oldToken));
+});
+
+await test('Email outbox retry behavior: Failed SMTP attempt records error while paid order remains intact', async () => {
+  const testOrderId = `ord_email_retry_test_${Date.now()}`;
+  mockDb.orders.set(testOrderId, {
+    id: testOrderId,
+    customer_name: 'Retry Customer',
+    customer_email: 'retry@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid',
+    download_token: 'token_retry_test'
+  });
+
+  const failTransport = async () => {
+    throw new Error('SMTP command failed: [AUTH_CREDENTIAL] returned 535: BadCredentials');
+  };
+
+  const failResult = await processOrderEmail(testOrderId, mockEnv, {
+    emailType: 'purchase_delivery',
+    customTransport: failTransport,
+    attachmentOverride: { filename: 'test.pdf', content: 'dummy' }
+  });
+
+  assert.equal(failResult.success, false);
+  assert.equal(failResult.status, 'failed');
+
+  const outboxRec = mockDb.outbox.get(`${testOrderId}_purchase_delivery`);
+  assert(outboxRec, 'Outbox record must exist');
+  assert.equal(outboxRec.status, 'failed');
+  assert.equal(outboxRec.attempts, 1);
+  assert(outboxRec.error_message.includes('535'));
+  assert(!outboxRec.error_message.includes('ZXNxd3F4'), 'Sensitive base64 string must NOT be logged');
+
+  // Verify order status in orders table is completely unaffected
+  assert.equal(mockDb.orders.get(testOrderId).status, 'paid');
+
+  // Retry with working transport
+  const successTransport = async () => ({ messageId: 'msg_success_retry_123' });
+
+  const retryResult = await processOrderEmail(testOrderId, mockEnv, {
+    emailType: 'purchase_delivery',
+    customTransport: successTransport,
+    attachmentOverride: { filename: 'test.pdf', content: 'dummy' }
+  });
+
+  assert.equal(retryResult.success, true);
+  assert.equal(retryResult.status, 'sent');
+  assert.equal(outboxRec.status, 'sent');
+  assert.equal(outboxRec.attempts, 2);
+});
+
+await test('Refund calculation: Full ₹149 refund updates order status to refunded based on stored D1 amount', async () => {
+  const rzpId = `order_rfnd_149_full_${Date.now()}`;
+  const payId = `pay_rfnd_149_full_${Date.now()}`;
+  mockDb.orders.set(rzpId, {
+    id: `ord_rfnd_149_full_${Date.now()}`,
+    razorpay_order_id: rzpId,
+    razorpay_payment_id: payId,
+    amount: 149,
+    currency: 'INR',
+    status: 'paid',
+    download_token: 'tok_149_full'
+  });
+
+  const payload = JSON.stringify({
+    entity: 'event',
+    event: 'refund.processed',
+    id: `evt_rfnd_149_full_${Date.now()}`,
+    payload: {
+      refund: {
+        entity: {
+          id: `rfnd_${Date.now()}`,
+          payment_id: payId,
+          amount: 14900,
+          currency: 'INR',
+          status: 'processed'
+        }
+      },
+      payment: {
+        entity: {
+          id: payId,
+          order_id: rzpId,
+          amount_refunded: 14900
+        }
+      }
+    }
+  });
+  const sig = await computeWebhookSig(payload, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+  const res = await handleWebhook({
+    request: {
+      text: async () => payload,
+      headers: { get: (h) => (h.toLowerCase() === 'x-razorpay-signature' ? sig : null) }
+    },
+    env: { ...mockEnv, PRODUCT_PRICE: '1' }
+  });
+  assert.equal(res.status, 200);
+  assert.equal(mockDb.orders.get(rzpId).status, 'refunded', 'Full ₹149 refund must transition status to refunded');
+});
+
+await test('Refund calculation: Partial ₹149 refund (< 14900 paise) sets status to partially_refunded', async () => {
+  const rzpId = `order_rfnd_149_part_${Date.now()}`;
+  const payId = `pay_rfnd_149_part_${Date.now()}`;
+  mockDb.orders.set(rzpId, {
+    id: `ord_rfnd_149_part_${Date.now()}`,
+    razorpay_order_id: rzpId,
+    razorpay_payment_id: payId,
+    amount: 149,
+    currency: 'INR',
+    status: 'paid',
+    download_token: 'tok_149_part'
+  });
+
+  const payload = JSON.stringify({
+    entity: 'event',
+    event: 'refund.processed',
+    id: `evt_rfnd_149_part_${Date.now()}`,
+    payload: {
+      refund: {
+        entity: {
+          id: `rfnd_part_${Date.now()}`,
+          payment_id: payId,
+          amount: 5000,
+          currency: 'INR',
+          status: 'processed'
+        }
+      },
+      payment: {
+        entity: {
+          id: payId,
+          order_id: rzpId,
+          amount_refunded: 5000
+        }
+      }
+    }
+  });
+  const sig = await computeWebhookSig(payload, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+  const res = await handleWebhook({
+    request: {
+      text: async () => payload,
+      headers: { get: (h) => (h.toLowerCase() === 'x-razorpay-signature' ? sig : null) }
+    },
+    env: { ...mockEnv, PRODUCT_PRICE: '1' }
+  });
+  assert.equal(res.status, 200);
+  assert.equal(mockDb.orders.get(rzpId).status, 'partially_refunded', 'Partial ₹149 refund must NOT be misclassified as full refund');
+});
+
+await test('Refund calculation: Full ₹1 refund updates order status to refunded based on stored D1 amount', async () => {
+  const rzpId = `order_rfnd_1inr_full_${Date.now()}`;
+  const payId = `pay_rfnd_1inr_full_${Date.now()}`;
+  mockDb.orders.set(rzpId, {
+    id: `ord_rfnd_1inr_full_${Date.now()}`,
+    razorpay_order_id: rzpId,
+    razorpay_payment_id: payId,
+    amount: 1,
+    currency: 'INR',
+    status: 'paid',
+    download_token: 'tok_1inr_full'
+  });
+
+  const payload = JSON.stringify({
+    entity: 'event',
+    event: 'refund.processed',
+    id: `evt_rfnd_1inr_full_${Date.now()}`,
+    payload: {
+      refund: {
+        entity: {
+          id: `rfnd_1inr_${Date.now()}`,
+          payment_id: payId,
+          amount: 100,
+          currency: 'INR',
+          status: 'processed'
+        }
+      },
+      payment: {
+        entity: {
+          id: payId,
+          order_id: rzpId,
+          amount_refunded: 100
+        }
+      }
+    }
+  });
+  const sig = await computeWebhookSig(payload, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+  const res = await handleWebhook({
+    request: {
+      text: async () => payload,
+      headers: { get: (h) => (h.toLowerCase() === 'x-razorpay-signature' ? sig : null) }
+    },
+    env: { ...mockEnv, PRODUCT_PRICE: '149' }
+  });
+  assert.equal(res.status, 200);
+  assert.equal(mockDb.orders.get(rzpId).status, 'refunded', 'Full ₹1 refund must transition status to refunded even if PRODUCT_PRICE is 149');
+});
+
+await test('Refund calculation: Partial ₹1 refund (< 100 paise) sets status to partially_refunded', async () => {
+  const rzpId = `order_rfnd_1inr_part_${Date.now()}`;
+  const payId = `pay_rfnd_1inr_part_${Date.now()}`;
+  mockDb.orders.set(rzpId, {
+    id: `ord_rfnd_1inr_part_${Date.now()}`,
+    razorpay_order_id: rzpId,
+    razorpay_payment_id: payId,
+    amount: 1,
+    currency: 'INR',
+    status: 'paid',
+    download_token: 'tok_1inr_part'
+  });
+
+  const payload = JSON.stringify({
+    entity: 'event',
+    event: 'refund.processed',
+    id: `evt_rfnd_1inr_part_${Date.now()}`,
+    payload: {
+      refund: {
+        entity: {
+          id: `rfnd_1inr_part_${Date.now()}`,
+          payment_id: payId,
+          amount: 50,
+          currency: 'INR',
+          status: 'processed'
+        }
+      },
+      payment: {
+        entity: {
+          id: payId,
+          order_id: rzpId,
+          amount_refunded: 50
+        }
+      }
+    }
+  });
+  const sig = await computeWebhookSig(payload, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+  const res = await handleWebhook({
+    request: {
+      text: async () => payload,
+      headers: { get: (h) => (h.toLowerCase() === 'x-razorpay-signature' ? sig : null) }
+    },
+    env: { ...mockEnv, PRODUCT_PRICE: '1' }
+  });
+  assert.equal(res.status, 200);
+  assert.equal(mockDb.orders.get(rzpId).status, 'partially_refunded', 'Partial ₹1 refund must update status to partially_refunded');
+});
+
+// 11. META CONVERSION TRACKING & STRICT PURCHASE AUTHORIZATION (PHASE 2)
+console.log('\n[Audit Test 11: Meta Conversion Tracking & Strict Purchase Authorization (Phase 2)]');
+
+await test('GET /api/download returns complete order metadata (success, status=paid, order_id, amount, currency) on verified paid orders', async () => {
+  const testOrderId = `ord_meta_test_${Date.now()}`;
+  const testToken = `tok_meta_valid_${Date.now()}`;
+  mockDb.orders.set(testOrderId, {
+    id: testOrderId,
+    razorpay_order_id: `rzp_meta_${Date.now()}`,
+    customer_name: 'Priya Sharma',
+    customer_email: 'priya@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid',
+    download_token: testToken,
+    download_count: 0
+  });
+
+  const req = { url: `http://localhost/api/download?order_id=${testOrderId}&token=${testToken}` };
+  const res = await handleDownload({ request: req, env: { ...mockEnv, PRODUCT_PRICE: '1' } });
+  assert.equal(res.status, 200);
+  const data = JSON.parse(await res.text());
+  assert.equal(data.success, true, 'Download response must have success: true');
+  assert.equal(data.status, 'paid', 'Download response must return server-confirmed status: paid');
+  assert.equal(data.order_id, testOrderId, 'Download response must return exact verified order_id');
+  assert.equal(data.amount, 1, 'Download response must return positive verified amount (1)');
+  assert.equal(data.currency, 'INR', 'Download response must return currency: INR');
+  assert(data.download_url, 'Download response must contain presigned download_url');
+});
+
+await test('GET /api/download rejects unpaid orders (status=created) and invalid tokens with HTTP 403', async () => {
+  const unpaidOrderId = `ord_meta_unpaid_${Date.now()}`;
+  const unpaidToken = `tok_meta_unpaid_${Date.now()}`;
+  mockDb.orders.set(unpaidOrderId, {
+    id: unpaidOrderId,
+    razorpay_order_id: `rzp_unpaid_${Date.now()}`,
+    customer_name: 'Unpaid Customer',
+    customer_email: 'unpaid@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'created', // UNPAID
+    download_token: unpaidToken,
+    download_count: 0
+  });
+
+  // 1. Unpaid order
+  const reqUnpaid = { url: `http://localhost/api/download?order_id=${unpaidOrderId}&token=${unpaidToken}` };
+  const resUnpaid = await handleDownload({ request: reqUnpaid, env: mockEnv });
+  assert.equal(resUnpaid.status, 403, 'Unpaid order must be rejected with HTTP 403');
+  const dataUnpaid = JSON.parse(await resUnpaid.text());
+  assert.equal(dataUnpaid.success, false, 'Unpaid order response must have success: false');
+
+  // 2. Invalid token
+  const reqBadToken = { url: `http://localhost/api/download?order_id=${unpaidOrderId}&token=fabricated_token` };
+  const resBadToken = await handleDownload({ request: reqBadToken, env: mockEnv });
+  assert.equal(resBadToken.status, 403, 'Fabricated token must be rejected with HTTP 403');
+  const dataBadToken = JSON.parse(await resBadToken.text());
+  assert.equal(dataBadToken.success, false, 'Fabricated token response must have success: false');
+});
+
+await test('thank-you.js strictly validates complete /api/download response before firing Purchase (HTTP 200 alone rejected)', async () => {
+  const thankYouJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/thank-you.js'), 'utf8');
+  assert(!thankYouJs.includes('// Idempotent Purchase Event Tracking on Thank You Page\n  if (window.Analytics && orderId) {'),
+    'Premature trackPurchase before /api/download fetch must be removed');
+  assert(thankYouJs.includes('data.status === \'paid\''), 'Must validate server-confirmed status is paid');
+  assert(thankYouJs.includes('typeof data.amount === \'number\' && data.amount > 0'), 'Must validate positive verified amount');
+  assert(thankYouJs.includes('data.currency === \'INR\''), 'Must validate currency is strictly INR');
+  assert(thankYouJs.includes('typeof data.order_id === \'string\' && data.order_id.trim().length > 0'), 'Must validate valid order_id');
+  assert(thankYouJs.includes('window.Analytics.trackPurchase('),
+    'Must call trackPurchase inside download verification handler');
+});
+
+await test('checkout.js does NOT fire premature browser Purchase event before redirect', async () => {
+  const checkoutJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/checkout.js'), 'utf8');
+  assert(!checkoutJs.includes('window.Analytics.trackPurchase('),
+    'checkout.js must not call trackPurchase before redirect (Purchase tracked exclusively on thank-you page)');
+  assert(checkoutJs.includes('window.location.href = data.redirect_url;'),
+    'checkout.js must cleanly redirect to thank-you URL after payment verification');
+});
+
+await test('analytics.js passes eventID as 4th parameter in fbq(track, Purchase) for Meta Deduplication', async () => {
+  const analyticsJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/analytics.js'), 'utf8');
+  assert(analyticsJs.includes("window.fbq('track', 'Purchase', payload, { eventID: orderId });"),
+    'Must pass { eventID: orderId } as 4th argument in fbq Purchase call for Meta Deduplication');
+});
+
+await test('analytics.js enforces in-session guard for InitiateCheckout to prevent duplicate events on modal close/reopen', async () => {
+  const analyticsJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/analytics.js'), 'utf8');
+  assert(analyticsJs.includes('meta_initiate_checkout_tracked'), 'Must use in-session key meta_initiate_checkout_tracked');
+  assert(analyticsJs.includes('sessionStorage.getItem(sessionKey)'), 'Must check sessionStorage before tracking InitiateCheckout');
+  assert(analyticsJs.includes('sessionStorage.setItem(sessionKey, \'true\')'), 'Must set sessionStorage flag after tracking InitiateCheckout');
+});
+
+await test('analytics.js and thank-you.js exclude all customer PII, tokens, and signatures from Meta event payloads', async () => {
+  const analyticsJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/analytics.js'), 'utf8');
+  const purchasePayloadIdx = analyticsJs.indexOf('// Strictly zero PII: Only product and order metadata');
+  assert(purchasePayloadIdx !== -1, 'Purchase zero-PII section comment must exist');
+  const purchasePayloadBlock = analyticsJs.slice(purchasePayloadIdx, purchasePayloadIdx + 600);
+  assert(!purchasePayloadBlock.includes('customer_email') && !purchasePayloadBlock.includes('email:'), 'Must not contain email');
+  assert(!purchasePayloadBlock.includes('customer_name') && !purchasePayloadBlock.includes('name: customer'), 'Must not contain customer name');
+  assert(!purchasePayloadBlock.includes('customer_phone') && !purchasePayloadBlock.includes('phone:'), 'Must not contain phone');
+  assert(!purchasePayloadBlock.includes('download_token') && !purchasePayloadBlock.includes('token:'), 'Must not contain token');
+  assert(!purchasePayloadBlock.includes('razorpay_signature') && !purchasePayloadBlock.includes('signature:'), 'Must not contain signature');
+});
+
+await test('analytics.js localStorage and sessionStorage idempotency guards suppress duplicate Purchase events on page refresh', async () => {
+  const analyticsJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/analytics.js'), 'utf8');
+  assert(analyticsJs.includes('sessionStorage.getItem(storageKey)'), 'Must check sessionStorage for order idempotency');
+  assert(analyticsJs.includes('localStorage.getItem(storageKey)'), 'Must check localStorage for order idempotency');
+  assert(analyticsJs.includes('sessionStorage.setItem(storageKey, \'true\')'), 'Must mark order as tracked in sessionStorage');
+  assert(analyticsJs.includes('localStorage.setItem(storageKey, \'true\')'), 'Must mark order as tracked in localStorage');
+});
+
+await test('Staging vs Production pricing configuration: Production uses ₹149 and enableMetaConversions: true', async () => {
+  const configJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/config.js'), 'utf8');
+  assert(configJs.includes('price: 149,'), 'Production client config must use ₹149 price');
+  assert(configJs.includes('currency: \'INR\','), 'Staging client config must use INR currency');
+  assert(configJs.includes('enableMetaConversions: true,'), 'Staging client config must have enableMetaConversions: true');
+  assert(configJs.includes("metaPixelId: '3370053963196277'"), 'Pixel ID 3370053963196277 must be preserved');
+
+  // Verify production env template / server config defaults
+  assert.equal(mockEnv.PRODUCT_PRICE, '149', 'Production environment price must be 149');
+  assert.equal(mockEnv.PRODUCT_CURRENCY, 'INR', 'Production currency must be INR');
+});
+
+await test('ViewContent is triggered exclusively on landing page and not on thank-you or legal pages', async () => {
+  const landingJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/landing.js'), 'utf8');
+  assert(landingJs.includes('window.Analytics.trackViewContent()'), 'landing.js must call window.Analytics.trackViewContent()');
+
+  // Verify thank-you.js does NOT call trackViewContent
+  const thankYouJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/thank-you.js'), 'utf8');
+  assert(!thankYouJs.includes('trackViewContent'), 'thank-you.js must NOT trigger ViewContent');
+
+  // Verify legal pages do NOT load landing.js or call trackViewContent
+  const legalFiles = ['terms.html', 'privacy.html', 'refund.html'];
+  legalFiles.forEach(file => {
+    const content = fs.readFileSync(path.join(ROOT_DIR, 'client/legal', file), 'utf8');
+    assert(!content.includes('landing.js'), `${file} must not load landing.js`);
+    assert(!content.includes('trackViewContent'), `${file} must not invoke trackViewContent`);
+  });
+
+  // Verify existing PageView implementation remains unchanged across all 6 HTML files
+  const allHtmlFiles = [
+    'client/index.html',
+    'client/ebook/index.html',
+    'client/thank-you/index.html',
+    'client/legal/terms.html',
+    'client/legal/privacy.html',
+    'client/legal/refund.html'
+  ];
+  allHtmlFiles.forEach(file => {
+    const content = fs.readFileSync(path.join(ROOT_DIR, file), 'utf8');
+    assert(content.includes("fbq('init', '3370053963196277')"), `${file} must preserve fbq('init', '3370053963196277')`);
+    assert(content.includes("fbq('track', 'PageView')"), `${file} must preserve fbq('track', 'PageView')`);
+  });
+});
+
+await test('Staging payment verification suppresses automatic email dispatch while verifying payment and updating order status', async () => {
+  const stagingOrderId = `ord_staging_email_suppress_${Date.now()}`;
+  const stagingRzpOrderId = `rzp_order_suppress_${Date.now()}`;
+  const stagingRzpPaymentId = `pay_suppress_${Date.now()}`;
+  const testCustomerEmail = 'staging_parent@example.com';
+
+  mockDb.orders.set(stagingOrderId, {
+    id: stagingOrderId,
+    razorpay_order_id: stagingRzpOrderId,
+    customer_name: 'Staging Tester',
+    customer_email: testCustomerEmail,
+    amount: 1,
+    currency: 'INR',
+    status: 'created'
+  });
+
+  const stagingEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'staging',
+    ENVIRONMENT: 'preview',
+    PRODUCT_PRICE: '1',
+    RAZORPAY_KEY_ID: 'rzp_test_TuaqfpTw4hAqFw',
+    RAZORPAY_KEY_SECRET: 'test_secret_suppress'
+  };
+
+  globalThis.__mockPaymentId = stagingRzpPaymentId;
+  globalThis.__mockPaymentOrderId = stagingRzpOrderId;
+  globalThis.__mockPaymentStatus = 'captured';
+  globalThis.__mockPaymentAmount = 100;
+  globalThis.__mockPaymentCurrency = 'INR';
+
+  const sig = await computeWebhookSig(`${stagingRzpOrderId}|${stagingRzpPaymentId}`, stagingEnv.RAZORPAY_KEY_SECRET);
+
+  const req = {
+    json: async () => ({
+      order_id: stagingOrderId,
+      razorpay_order_id: stagingRzpOrderId,
+      razorpay_payment_id: stagingRzpPaymentId,
+      razorpay_signature: sig,
+      email: testCustomerEmail
+    })
+  };
+
+  const res = await handleVerifyPayment({ request: req, env: stagingEnv });
+  delete globalThis.__mockPaymentId;
+  delete globalThis.__mockPaymentOrderId;
+  delete globalThis.__mockPaymentStatus;
+  delete globalThis.__mockPaymentAmount;
+  delete globalThis.__mockPaymentCurrency;
+
+  assert.equal(res.status, 200, 'Payment verification must succeed with HTTP 200');
+  const data = JSON.parse(await res.text());
+  assert.equal(data.success, true, 'Verification must return success: true');
+  assert.equal(data.verified, true, 'Verification must return verified: true');
+  assert(data.download_token, 'Verification must issue a download token');
+
+  // Verify D1 order status was updated to 'paid'
+  const updatedOrder = mockDb.orders.get(stagingOrderId);
+  assert.equal(updatedOrder.status, 'paid', 'D1 order status must be updated to paid');
+  assert.equal(updatedOrder.razorpay_payment_id, stagingRzpPaymentId, 'Payment ID must be persisted');
+
+  // Verify NO email outbox entry was created for purchase_delivery
+  const outboxEntry = mockDb.outbox.get(`${stagingOrderId}_purchase_delivery`);
+  assert(!outboxEntry, 'Staging payment verification must NOT dispatch email (outbox must be empty)');
+});
+
+await test('Staging webhook suppresses automatic email dispatch while marking order paid', async () => {
+  const webhookOrderId = `ord_staging_wh_suppress_${Date.now()}`;
+  const webhookRzpOrderId = `rzp_wh_suppress_${Date.now()}`;
+  const webhookPaymentId = `pay_wh_suppress_${Date.now()}`;
+
+  mockDb.orders.set(webhookRzpOrderId, {
+    id: webhookOrderId,
+    razorpay_order_id: webhookRzpOrderId,
+    customer_name: 'Webhook Tester',
+    customer_email: 'webhook_tester@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'created'
+  });
+
+  const stagingEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'staging',
+    ENVIRONMENT: 'preview',
+    PRODUCT_PRICE: '1',
+    RAZORPAY_WEBHOOK_SECRET: 'webhook_secret_suppress'
+  };
+
+  const payload = JSON.stringify({
+    event: 'payment.captured',
+    event_id: `evt_suppress_${Date.now()}`,
+    payload: {
+      payment: {
+        entity: {
+          id: webhookPaymentId,
+          order_id: webhookRzpOrderId
+        }
+      }
+    }
+  });
+
+  const sig = await computeWebhookSig(payload, stagingEnv.RAZORPAY_WEBHOOK_SECRET);
+
+  const res = await handleWebhook({
+    request: {
+      text: async () => payload,
+      headers: { get: (h) => (h.toLowerCase() === 'x-razorpay-signature' ? sig : null) }
+    },
+    env: stagingEnv
+  });
+
+  assert.equal(res.status, 200, 'Webhook must return HTTP 200');
+  const data = JSON.parse(await res.text());
+  assert.equal(data.status, 'success', 'Webhook must return status: success');
+
+  // Verify D1 order status was updated to 'paid'
+  const updatedOrder = mockDb.orders.get(webhookRzpOrderId);
+  assert.equal(updatedOrder.status, 'paid', 'D1 order status must be updated to paid');
+
+  // Verify NO email outbox entry was created
+  const outboxEntry = mockDb.outbox.get(`${webhookOrderId}_purchase_delivery`);
+  assert(!outboxEntry, 'Staging webhook must NOT dispatch email (outbox must be empty)');
+});
+
+await test('processOrderEmail directly enforces Gate 3 staging email suppression for purchase_delivery', async () => {
+  const directOrderId = `ord_direct_suppress_${Date.now()}`;
+  mockDb.orders.set(directOrderId, {
+    id: directOrderId,
+    razorpay_order_id: `rzp_direct_${Date.now()}`,
+    customer_name: 'Direct Tester',
+    customer_email: 'direct_tester@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid'
+  });
+
+  const stagingEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'staging',
+    ENVIRONMENT: 'preview'
+  };
+
+  const res = await processOrderEmail(directOrderId, stagingEnv);
+  assert.equal(res.success, true, 'Suppressed call returns success: true');
+  assert.equal(res.status, 'staging_suppressed', 'Status must be staging_suppressed');
+  const outboxEntry = mockDb.outbox.get(`${directOrderId}_purchase_delivery`);
+  assert(!outboxEntry, 'No outbox record should exist when staging suppression is active');
+});
+
+await test('Production email dispatch remains completely active and unsuppressed', async () => {
+  const prodOrderId = `ord_prod_email_active_${Date.now()}`;
+  mockDb.orders.set(prodOrderId, {
+    id: prodOrderId,
+    razorpay_order_id: `rzp_prod_${Date.now()}`,
+    customer_name: 'Real Customer',
+    customer_email: 'customer@example.com',
+    amount: 149,
+    currency: 'INR',
+    status: 'paid'
+  });
+
+  // Production environment configuration
+  const prodEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'main',
+    ENVIRONMENT: 'production',
+    PRODUCT_PRICE: '149'
+  };
+
+  let mockSent = false;
+  let sentOptions = null;
+  const res = await processOrderEmail(prodOrderId, prodEnv, {
+    attachmentOverride: {
+      buffer: mockPdfBuffer,
+      filename: 'Kids_Drawing_Book_Animals_School_Edition.pdf',
+      contentType: 'application/pdf',
+      size: mockPdfBuffer.length
+    },
+    customTransport: async (mailOptions) => {
+      mockSent = true;
+      sentOptions = mailOptions;
+      return { success: true, messageId: '<prod-msg-123@smtp.gmail.com>' };
+    }
+  });
+
+  assert.equal(res.success, true, 'Production email processing must succeed');
+  assert.equal(res.status, 'sent', 'Production email status must be sent');
+  assert.equal(mockSent, true, 'Production transport send must be called');
+  assert.equal(sentOptions?.to, 'customer@example.com', 'Recipient email must match');
+  const outbox = mockDb.outbox.get(`${prodOrderId}_purchase_delivery`);
+  assert(outbox, 'Outbox record must exist in production');
+  assert.equal(outbox.status, 'sent', 'Outbox status must be sent');
+});
+
+await test('classifyEmailEnvironment correctly classifies environments and enforces production precedence', async () => {
+  // 1. Explicit production
+  const prodRes = classifyEmailEnvironment({ CF_PAGES_BRANCH: 'main', ENVIRONMENT: 'production' });
+  assert.equal(prodRes.isExplicitProd, true);
+  assert.equal(prodRes.shouldSuppressPurchaseDelivery, false);
+
+  // 2. Production with SUPPRESS_STAGING_EMAILS=true (Precedence check)
+  const prodSuppressedFlagRes = classifyEmailEnvironment({
+    CF_PAGES_BRANCH: 'main',
+    ENVIRONMENT: 'production',
+    SUPPRESS_STAGING_EMAILS: 'true'
+  });
+  assert.equal(prodSuppressedFlagRes.isExplicitProd, true, 'Production precedence must hold');
+  assert.equal(prodSuppressedFlagRes.shouldSuppressPurchaseDelivery, false, 'SUPPRESS_STAGING_EMAILS must never suppress production');
+
+  // 3. Explicit staging
+  const stagingRes = classifyEmailEnvironment({ CF_PAGES_BRANCH: 'staging', ENVIRONMENT: 'preview' });
+  assert.equal(stagingRes.isExplicitStaging, true);
+  assert.equal(stagingRes.shouldSuppressPurchaseDelivery, true);
+
+  // 4. Conflicting environment signals
+  const conflictRes = classifyEmailEnvironment({ CF_PAGES_BRANCH: 'staging', ENVIRONMENT: 'production' });
+  assert.equal(conflictRes.isConflicting, true);
+  assert.equal(conflictRes.isExplicitProd, false);
+  assert.equal(conflictRes.shouldSuppressPurchaseDelivery, true);
+
+  // 5. Missing / unknown environment signals
+  const missingRes = classifyEmailEnvironment({});
+  assert.equal(missingRes.isUnknown, true);
+  assert.equal(missingRes.isExplicitProd, false);
+  assert.equal(missingRes.shouldSuppressPurchaseDelivery, true);
+
+  // 6. Null / non-object environment
+  const nullRes = classifyEmailEnvironment(null);
+  assert.equal(nullRes.isUnknown, true);
+  assert.equal(nullRes.shouldSuppressPurchaseDelivery, true);
+});
+
+await test('Production email remains active and unsuppressed even when SUPPRESS_STAGING_EMAILS=true (Production Precedence)', async () => {
+  const precedenceOrderId = `ord_prod_precedence_${Date.now()}`;
+  mockDb.orders.set(precedenceOrderId, {
+    id: precedenceOrderId,
+    razorpay_order_id: `rzp_prod_precedence_${Date.now()}`,
+    customer_name: 'Precedence Customer',
+    customer_email: 'precedence@example.com',
+    amount: 149,
+    currency: 'INR',
+    status: 'paid'
+  });
+
+  const prodEnvWithSuppression = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'main',
+    ENVIRONMENT: 'production',
+    PRODUCT_PRICE: '149',
+    SUPPRESS_STAGING_EMAILS: 'true'
+  };
+
+  let mockSent = false;
+  const res = await processOrderEmail(precedenceOrderId, prodEnvWithSuppression, {
+    attachmentOverride: {
+      buffer: mockPdfBuffer,
+      filename: 'Kids_Drawing_Book_Animals_School_Edition.pdf',
+      contentType: 'application/pdf',
+      size: mockPdfBuffer.length
+    },
+    customTransport: async () => {
+      mockSent = true;
+      return { success: true, messageId: '<prod-precedence-msg@smtp.gmail.com>' };
+    }
+  });
+
+  assert.equal(res.success, true, 'Production email processing must succeed');
+  assert.equal(res.status, 'sent', 'Production email status must be sent');
+  assert.equal(mockSent, true, 'Production transport send must be called even when SUPPRESS_STAGING_EMAILS=true');
+  const outbox = mockDb.outbox.get(`${precedenceOrderId}_purchase_delivery`);
+  assert(outbox, 'Outbox record must exist in production');
+  assert.equal(outbox.status, 'sent');
+});
+
+await test('Missing or empty environment signals fail closed and suppress purchase email dispatch', async () => {
+  const missingEnvOrderId = `ord_missing_env_${Date.now()}`;
+  mockDb.orders.set(missingEnvOrderId, {
+    id: missingEnvOrderId,
+    razorpay_order_id: `rzp_missing_env_${Date.now()}`,
+    customer_name: 'Missing Env Customer',
+    customer_email: 'missing_env@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid'
+  });
+
+  const missingEnv = {
+    DB: mockDb
+  };
+
+  const res = await processOrderEmail(missingEnvOrderId, missingEnv);
+  assert.equal(res.success, true);
+  assert.equal(res.status, 'staging_suppressed', 'Missing environment must fail closed and suppress email');
+  assert(res.reason.includes('fail-closed'), 'Reason must indicate fail-closed behavior');
+  const outbox = mockDb.outbox.get(`${missingEnvOrderId}_purchase_delivery`);
+  assert(!outbox, 'No outbox record must exist for missing environment');
+});
+
+await test('Conflicting environment signals fail closed and suppress purchase email dispatch', async () => {
+  const conflictOrderId = `ord_conflict_env_${Date.now()}`;
+  mockDb.orders.set(conflictOrderId, {
+    id: conflictOrderId,
+    razorpay_order_id: `rzp_conflict_env_${Date.now()}`,
+    customer_name: 'Conflict Customer',
+    customer_email: 'conflict@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid'
+  });
+
+  const conflictingEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'staging',
+    ENVIRONMENT: 'production'
+  };
+
+  const res = await processOrderEmail(conflictOrderId, conflictingEnv);
+  assert.equal(res.success, true);
+  assert.equal(res.status, 'staging_suppressed', 'Conflicting environment must fail closed and suppress email');
+  assert(res.reason.includes('Conflicting'), 'Reason must indicate conflicting signals');
+  const outbox = mockDb.outbox.get(`${conflictOrderId}_purchase_delivery`);
+  assert(!outbox, 'No outbox record must exist for conflicting environment');
+});
+
+await test('customTransport in staging cannot bypass staging email suppression for purchase_delivery', async () => {
+  const bypassAttemptOrderId = `ord_bypass_attempt_${Date.now()}`;
+  mockDb.orders.set(bypassAttemptOrderId, {
+    id: bypassAttemptOrderId,
+    razorpay_order_id: `rzp_bypass_${Date.now()}`,
+    customer_name: 'Bypass Tester',
+    customer_email: 'bypass@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid'
+  });
+
+  const stagingEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'staging',
+    ENVIRONMENT: 'preview'
+  };
+
+  let transportCalled = false;
+  const res = await processOrderEmail(bypassAttemptOrderId, stagingEnv, {
+    emailType: 'purchase_delivery',
+    customTransport: async () => {
+      transportCalled = true;
+      return { success: true };
+    }
+  });
+
+  assert.equal(res.success, true);
+  assert.equal(res.status, 'staging_suppressed', 'customTransport must NOT bypass staging suppression');
+  assert.equal(transportCalled, false, 'customTransport must NOT be called in staging for purchase_delivery');
+  const outbox = mockDb.outbox.get(`${bypassAttemptOrderId}_purchase_delivery`);
+  assert(!outbox, 'No outbox record must be created when suppressed in staging');
+});
+
+await test('Payment verification in conflicting environment marks order paid in D1 while suppressing email', async () => {
+  const conflictOrderId = `ord_verify_conflict_${Date.now()}`;
+  const conflictRzpId = `rzp_verify_conflict_${Date.now()}`;
+  const conflictPayId = `pay_verify_conflict_${Date.now()}`;
+
+  mockDb.orders.set(conflictOrderId, {
+    id: conflictOrderId,
+    razorpay_order_id: conflictRzpId,
+    customer_name: 'Conflict Verifier',
+    customer_email: 'conflict_verify@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'created'
+  });
+
+  const conflictingEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'staging',
+    ENVIRONMENT: 'production',
+    PRODUCT_PRICE: '1',
+    RAZORPAY_KEY_SECRET: 'test_sec_conflict'
+  };
+
+  globalThis.__mockPaymentId = conflictPayId;
+  globalThis.__mockPaymentOrderId = conflictRzpId;
+  globalThis.__mockPaymentStatus = 'captured';
+  globalThis.__mockPaymentAmount = 100;
+  globalThis.__mockPaymentCurrency = 'INR';
+
+  const sig = await computeWebhookSig(`${conflictRzpId}|${conflictPayId}`, conflictingEnv.RAZORPAY_KEY_SECRET);
+
+  const res = await handleVerifyPayment({
+    request: {
+      json: async () => ({
+        order_id: conflictOrderId,
+        razorpay_order_id: conflictRzpId,
+        razorpay_payment_id: conflictPayId,
+        razorpay_signature: sig,
+        email: 'conflict_verify@example.com'
+      })
+    },
+    env: conflictingEnv
+  });
+
+  delete globalThis.__mockPaymentId;
+  delete globalThis.__mockPaymentOrderId;
+  delete globalThis.__mockPaymentStatus;
+  delete globalThis.__mockPaymentAmount;
+  delete globalThis.__mockPaymentCurrency;
+
+  assert.equal(res.status, 200, 'Payment verification succeeds despite conflicting email environment');
+  const data = JSON.parse(await res.text());
+  assert.equal(data.success, true);
+  assert.equal(data.verified, true);
+  assert.equal(mockDb.orders.get(conflictOrderId).status, 'paid', 'D1 order status must be paid');
+  const outbox = mockDb.outbox.get(`${conflictOrderId}_purchase_delivery`);
+  assert(!outbox, 'Conflicting environment must NOT dispatch email');
+});
+
+console.log('\n[Audit Test 12: Meta Conversions API (CAPI) Server-Side Tracking & Deduplication (Phase 3)]');
+
+await test('Valid paid order creates a CAPI Purchase event', async () => {
+  const orderId = `ord_capi_valid_${Date.now()}`;
+  const rzpId = `rzp_capi_valid_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: rzpId,
+    customer_name: 'Jane Doe',
+    customer_email: 'jane.doe@example.com',
+    customer_phone: '9876543210',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid',
+    paid_at: '2026-11-20T12:00:00.000Z'
+  });
+
+  globalThis.__lastMetaCapiCall = null;
+  const res = await sendCapiPurchaseEvent(orderId, mockEnv);
+  assert.equal(res.success, true);
+  assert.equal(res.status, 'sent');
+  assert.equal(res.events_received, 1);
+  assert(res.fbtrace_id, 'fbtrace_id must be returned');
+
+  const capiRec = mockDb.capi_events.get(`${orderId}_Purchase`);
+  assert(capiRec, 'capi_events record must exist in D1');
+  assert.equal(capiRec.status, 'sent');
+  assert.equal(capiRec.attempts, 1);
+  assert.equal(capiRec.meta_event_id, orderId);
+
+  assert(globalThis.__lastMetaCapiCall, 'Meta Graph API must have been called');
+  assert(globalThis.__lastMetaCapiCall.url.includes('/events'), 'Must POST to /events');
+  assert(globalThis.__lastMetaCapiCall.url.includes(META_PIXEL_ID_DEFAULT), 'Must target Pixel ID');
+  assert(globalThis.__lastMetaCapiCall.url.includes('/v26.0/'), 'Must use Graph API v26.0');
+  const payload = globalThis.__lastMetaCapiCall.body;
+  assert(Array.isArray(payload.data) && payload.data.length === 1);
+  const ev = payload.data[0];
+  assert.equal(ev.event_name, 'Purchase');
+  assert.equal(ev.event_id, orderId, 'event_id must exactly match stable order ID');
+  const expectedEventTime = parseUtcToUnixSeconds('2026-11-20T12:00:00.000Z');
+  assert.equal(ev.event_time, expectedEventTime, 'event_time must match paid_at in Unix seconds');
+  assert.equal(ev.action_source, 'website');
+  assert.equal(ev.custom_data.value, 1);
+  assert.equal(ev.custom_data.currency, 'INR');
+  assert.equal(ev.custom_data.order_id, orderId);
+
+  const expectedEmailHash = await sha256Hex('jane.doe@example.com');
+  const expectedPhoneHash = await sha256Hex('9876543210');
+  const expectedFirstNameHash = await sha256Hex('jane');
+  const expectedLastNameHash = await sha256Hex('doe');
+  assert.deepEqual(ev.user_data.em, [expectedEmailHash]);
+  assert.deepEqual(ev.user_data.ph, [expectedPhoneHash]);
+  assert.deepEqual(ev.user_data.fn, [expectedFirstNameHash]);
+  assert.deepEqual(ev.user_data.ln, [expectedLastNameHash]);
+});
+
+await test('Pending order does not create an event', async () => {
+  const orderId = `ord_capi_pending_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: `rzp_pending_${Date.now()}`,
+    customer_email: 'pending@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'created'
+  });
+
+  globalThis.__lastMetaCapiCall = null;
+  const res = await sendCapiPurchaseEvent(orderId, mockEnv);
+  assert.equal(res.success, false);
+  assert.equal(res.status, 'order_not_paid');
+  assert.equal(globalThis.__lastMetaCapiCall, null, 'Must NOT dispatch to Meta for pending order');
+  const capiRec = mockDb.capi_events.get(`${orderId}_Purchase`);
+  assert(!capiRec, 'Must not create capi_events record for non-paid order');
+});
+
+await test('Failed payment does not create an event', async () => {
+  const orderId = `ord_capi_failed_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: `rzp_failed_${Date.now()}`,
+    customer_email: 'failed@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'failed'
+  });
+
+  globalThis.__lastMetaCapiCall = null;
+  const res = await sendCapiPurchaseEvent(orderId, mockEnv);
+  assert.equal(res.success, false);
+  assert.equal(res.status, 'order_not_paid');
+  assert.equal(globalThis.__lastMetaCapiCall, null, 'Must NOT dispatch to Meta for failed order');
+});
+
+await test('Invalid order ID is rejected', async () => {
+  const res1 = await sendCapiPurchaseEvent('', mockEnv);
+  assert.equal(res1.success, false);
+  assert.equal(res1.status, 'invalid_order_id');
+
+  const res2 = await sendCapiPurchaseEvent(null, mockEnv);
+  assert.equal(res2.success, false);
+  assert.equal(res2.status, 'invalid_order_id');
+
+  const res3 = await sendCapiPurchaseEvent('ord_non_existent_12345', mockEnv);
+  assert.equal(res3.success, false);
+  assert.equal(res3.status, 'order_not_found');
+});
+
+await test('Invalid amount is rejected', async () => {
+  const orderId = `ord_capi_bad_amt_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: `rzp_bad_amt_${Date.now()}`,
+    customer_email: 'badamt@example.com',
+    amount: 0,
+    currency: 'INR',
+    status: 'paid'
+  });
+
+  const res = await sendCapiPurchaseEvent(orderId, mockEnv);
+  assert.equal(res.success, false);
+  assert.equal(res.status, 'invalid_amount');
+});
+
+await test('Wrong currency is rejected', async () => {
+  const orderId = `ord_capi_bad_curr_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: `rzp_bad_curr_${Date.now()}`,
+    customer_email: 'badcurr@example.com',
+    amount: 1,
+    currency: 'USD',
+    status: 'paid'
+  });
+
+  const res = await sendCapiPurchaseEvent(orderId, mockEnv);
+  assert.equal(res.success, false);
+  assert.equal(res.status, 'invalid_currency');
+});
+
+await test('Missing CAPI token fails safely', async () => {
+  const orderId = `ord_capi_no_token_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: `rzp_no_token_${Date.now()}`,
+    customer_email: 'notoken@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid',
+    paid_at: '2026-11-20T12:00:00.000Z'
+  });
+
+  const envWithoutToken = { ...mockEnv, META_CAPI_ACCESS_TOKEN: '' };
+  globalThis.__lastMetaCapiCall = null;
+  const res = await sendCapiPurchaseEvent(orderId, envWithoutToken);
+  assert.equal(res.success, false);
+  assert.equal(res.status, 'missing_token');
+  assert.equal(globalThis.__lastMetaCapiCall, null);
+  const capiRec = mockDb.capi_events.get(`${orderId}_Purchase`);
+  assert(capiRec, 'capi_events record created');
+  assert.equal(capiRec.status, 'failed');
+  assert(capiRec.error_message.includes('not configured'));
+});
+
+await test('Duplicate webhook delivery does not create duplicate events', async () => {
+  const orderId = `ord_wh_dup_${Date.now()}`;
+  const rzpOrderId = `order_wh_dup_${Date.now()}`;
+  const rzpPaymentId = `pay_wh_dup_${Date.now()}`;
+  mockDb.orders.set(rzpOrderId, {
+    id: orderId,
+    razorpay_order_id: rzpOrderId,
+    customer_email: 'wh_dup@example.com',
+    amount: 149,
+    currency: 'INR',
+    status: 'created'
+  });
+
+  const eventPayload = {
+    event: 'payment.captured',
+    event_id: `evt_wh_dup_${Date.now()}`,
+    payload: {
+      payment: {
+        entity: {
+          id: rzpPaymentId,
+          order_id: rzpOrderId,
+          status: 'captured',
+          amount: 14900,
+          currency: 'INR',
+          created_at: 1732103456
+        }
+      }
+    }
+  };
+  const rawBody = JSON.stringify(eventPayload);
+  const sig = await computeWebhookSig(rawBody, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+
+  globalThis.__metaCapiCallCount = 0;
+  const res1 = await handleWebhook({
+    request: {
+      headers: new Headers({ 'x-razorpay-signature': sig }),
+      text: async () => rawBody
+    },
+    env: mockEnv
+  });
+  assert.equal(res1.status, 200);
+
+  const res2 = await handleWebhook({
+    request: {
+      headers: new Headers({ 'x-razorpay-signature': sig }),
+      text: async () => rawBody
+    },
+    env: mockEnv
+  });
+  assert.equal(res2.status, 200);
+  const data2 = JSON.parse(await res2.text());
+  assert.equal(data2.status, 'already_processed');
+
+  assert.equal(globalThis.__metaCapiCallCount, 1, 'Meta CAPI must be called exactly once despite duplicate webhooks');
+  const capiRec = mockDb.capi_events.get(`${orderId}_Purchase`);
+  assert.equal(capiRec.status, 'sent');
+  assert.equal(capiRec.attempts, 1);
+});
+
+await test('Repeated payment verification does not create duplicate events', async () => {
+  const orderId = `ord_verify_dup_${Date.now()}`;
+  const rzpOrderId = `order_verify_dup_${Date.now()}`;
+  const rzpPaymentId = `pay_verify_dup_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: rzpOrderId,
+    customer_email: 'verify_dup@example.com',
+    amount: 149,
+    currency: 'INR',
+    status: 'created'
+  });
+
+  globalThis.__mockPaymentId = rzpPaymentId;
+  globalThis.__mockPaymentOrderId = rzpOrderId;
+  globalThis.__mockPaymentStatus = 'captured';
+  globalThis.__mockPaymentAmount = 14900;
+  globalThis.__mockPaymentCurrency = 'INR';
+
+  const sig = await computeWebhookSig(`${rzpOrderId}|${rzpPaymentId}`, mockEnv.RAZORPAY_KEY_SECRET);
+
+  globalThis.__metaCapiCallCount = 0;
+  const res1 = await handleVerifyPayment({
+    request: {
+      headers: new Headers({ 'cf-connecting-ip': '1.2.3.4', 'user-agent': 'TestAgent/1.0' }),
+      json: async () => ({
+        order_id: orderId,
+        razorpay_order_id: rzpOrderId,
+        razorpay_payment_id: rzpPaymentId,
+        razorpay_signature: sig
+      })
+    },
+    env: mockEnv
+  });
+  assert.equal(res1.status, 200);
+
+  const res2 = await handleVerifyPayment({
+    request: {
+      headers: new Headers({ 'cf-connecting-ip': '1.2.3.4', 'user-agent': 'TestAgent/1.0' }),
+      json: async () => ({
+        order_id: orderId,
+        razorpay_order_id: rzpOrderId,
+        razorpay_payment_id: rzpPaymentId,
+        razorpay_signature: sig
+      })
+    },
+    env: mockEnv
+  });
+  assert.equal(res2.status, 200);
+
+  delete globalThis.__mockPaymentId;
+  delete globalThis.__mockPaymentOrderId;
+  delete globalThis.__mockPaymentStatus;
+  delete globalThis.__mockPaymentAmount;
+  delete globalThis.__mockPaymentCurrency;
+
+  assert.equal(globalThis.__metaCapiCallCount, 1, 'Meta CAPI must be called exactly once despite repeated verification');
+  const capiRec = mockDb.capi_events.get(`${orderId}_Purchase`);
+  assert.equal(capiRec.status, 'sent');
+  assert.equal(capiRec.attempts, 1);
+});
+
+await test('Concurrent webhook and verification requests are idempotent', async () => {
+  const orderId = `ord_concurrent_${Date.now()}`;
+  const rzpOrderId = `order_concurrent_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: rzpOrderId,
+    customer_email: 'concurrent@example.com',
+    amount: 149,
+    currency: 'INR',
+    status: 'paid',
+    paid_at: '2026-11-20T12:00:00.000Z'
+  });
+
+  globalThis.__metaCapiCallCount = 0;
+  const [res1, res2] = await Promise.all([
+    sendCapiPurchaseEvent(orderId, mockEnv),
+    sendCapiPurchaseEvent(orderId, mockEnv)
+  ]);
+
+  const oneSuccess = (res1.status === 'sent' && (res2.status === 'lock_not_acquired' || res2.status === 'already_sent')) ||
+                     (res2.status === 'sent' && (res1.status === 'lock_not_acquired' || res1.status === 'already_sent'));
+  assert(oneSuccess, 'Exactly one concurrent worker must dispatch to Meta');
+  assert.equal(globalThis.__metaCapiCallCount, 1, 'Only 1 network call made to Meta Graph API');
+});
+
+await test('Meta API failure is recorded safely and can be retried without creating duplicate outbox records', async () => {
+  const orderId = `ord_capi_retry_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: `rzp_retry_${Date.now()}`,
+    customer_email: 'retry@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid',
+    paid_at: '2026-11-20T12:00:00.000Z'
+  });
+
+  globalThis.__mockMetaApiError = true;
+  const failRes = await sendCapiPurchaseEvent(orderId, mockEnv);
+  assert.equal(failRes.success, false);
+  assert.equal(failRes.status, 'meta_api_error');
+  assert.equal(failRes.fbtrace_id, 'tr_mock_err_999');
+
+  const failedRec = mockDb.capi_events.get(`${orderId}_Purchase`);
+  assert(failedRec, 'Record must exist');
+  assert.equal(failedRec.status, 'failed');
+  assert.equal(failedRec.attempts, 1);
+  assert.equal(mockDb.orders.get(orderId).status, 'paid', 'Order status must remain paid despite CAPI failure');
+
+  delete globalThis.__mockMetaApiError;
+  const retryRes = await sendCapiPurchaseEvent(orderId, mockEnv);
+  assert.equal(retryRes.success, true);
+  assert.equal(retryRes.status, 'sent');
+
+  const sentRec = mockDb.capi_events.get(`${orderId}_Purchase`);
+  assert.equal(sentRec.status, 'sent');
+  assert.equal(sentRec.attempts, 2, 'Attempts must increment on retry');
+  assert.equal(sentRec.fbtrace_id, 'tr_mock_success_123');
+  assert.equal(Array.from(mockDb.capi_events.keys()).filter(k => k.startsWith(orderId)).length, 1, 'Exactly 1 outbox record must exist');
+});
+
+await test('Token is never exposed in logs or responses', async () => {
+  const secretToken = 'EAABmockSecretAccessToken1234567890abcdef';
+  const envWithSecret = { ...mockEnv, META_CAPI_ACCESS_TOKEN: secretToken };
+  const orderId = `ord_capi_leak_check_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: `rzp_leak_${Date.now()}`,
+    customer_email: 'leakcheck@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid',
+    paid_at: '2026-11-20T12:00:00.000Z'
+  });
+
+  globalThis.__mockMetaApiError = true;
+  const res = await sendCapiPurchaseEvent(orderId, envWithSecret);
+  delete globalThis.__mockMetaApiError;
+
+  const resStr = JSON.stringify(res);
+  assert(!resStr.includes(secretToken), 'Response must not contain access token');
+
+  const capiRec = mockDb.capi_events.get(`${orderId}_Purchase`);
+  assert(!capiRec.error_message.includes(secretToken), 'Error message must not contain access token');
+
+  const rawErrMsg = `Failed to connect with token ${secretToken}`;
+  const sanitized = sanitizeErrorMessage(rawErrMsg);
+  assert(!sanitized.includes(secretToken), 'Sanitized string must not contain access token');
+  assert(sanitized.includes('[REDACTED_ACCESS_TOKEN]'));
+});
+
+await test('Staging email suppression remains functional alongside CAPI', async () => {
+  const orderId = `ord_staging_capi_email_${Date.now()}`;
+  const rzpOrderId = `order_stg_ce_${Date.now()}`;
+  const rzpPaymentId = `pay_stg_ce_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: rzpOrderId,
+    customer_email: 'staging_capi@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'created'
+  });
+
+  const stagingEnv = {
+    ...mockEnv,
+    CF_PAGES_BRANCH: 'staging',
+    ENVIRONMENT: 'preview',
+    PRODUCT_PRICE: '1',
+    META_CAPI_ACCESS_TOKEN: 'MOCK_STAGING_CAPI_TOKEN_123'
+  };
+
+  globalThis.__mockPaymentId = rzpPaymentId;
+  globalThis.__mockPaymentOrderId = rzpOrderId;
+  globalThis.__mockPaymentStatus = 'captured';
+  globalThis.__mockPaymentAmount = 100;
+  globalThis.__mockPaymentCurrency = 'INR';
+
+  const sig = await computeWebhookSig(`${rzpOrderId}|${rzpPaymentId}`, stagingEnv.RAZORPAY_KEY_SECRET);
+
+  globalThis.__lastMetaCapiCall = null;
+  const res = await handleVerifyPayment({
+    request: {
+      headers: new Headers({ 'cf-connecting-ip': '1.2.3.4' }),
+      json: async () => ({
+        order_id: orderId,
+        razorpay_order_id: rzpOrderId,
+        razorpay_payment_id: rzpPaymentId,
+        razorpay_signature: sig
+      })
+    },
+    env: stagingEnv
+  });
+
+  delete globalThis.__mockPaymentId;
+  delete globalThis.__mockPaymentOrderId;
+  delete globalThis.__mockPaymentStatus;
+  delete globalThis.__mockPaymentAmount;
+  delete globalThis.__mockPaymentCurrency;
+
+  assert.equal(res.status, 200);
+  assert.equal(mockDb.orders.get(orderId).status, 'paid');
+
+  const emailOutbox = mockDb.outbox.get(`${orderId}_purchase_delivery`);
+  assert(!emailOutbox, 'Staging email suppression must be preserved');
+
+  const capiRec = mockDb.capi_events.get(`${orderId}_Purchase`);
+  assert(capiRec, 'CAPI event record must exist');
+  assert.equal(capiRec.status, 'sent', 'CAPI event must be successfully dispatched in staging');
+});
+
+await test('Existing browser Pixel events remain unchanged', async () => {
+  const analyticsJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/analytics.js'), 'utf8');
+  const thankYouJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/thank-you.js'), 'utf8');
+  const landingJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/landing.js'), 'utf8');
+  const checkoutJs = fs.readFileSync(path.join(ROOT_DIR, 'client/assets/js/checkout.js'), 'utf8');
+
+  assert(analyticsJs.includes("fbq('track', 'Purchase', payload, { eventID: orderId })"), 'fbq Purchase must pass eventID matching orderId');
+  assert(analyticsJs.includes("trackPageView"), 'PageView tracking function must exist');
+  assert(analyticsJs.includes("trackViewContent"), 'ViewContent tracking function must exist');
+  assert(analyticsJs.includes("trackInitiateCheckout"), 'InitiateCheckout tracking function must exist');
+  assert(thankYouJs.includes("window.Analytics.trackPurchase"), 'thank-you.js must invoke Analytics.trackPurchase on verified order');
+  assert(landingJs.includes("Analytics.trackViewContent"), 'landing.js must invoke trackViewContent');
+  assert(checkoutJs.includes("Analytics.trackInitiateCheckout"), 'checkout.js must invoke trackInitiateCheckout');
+});
+
+await test('parseUtcToUnixSeconds parses various formats deterministically with explicit UTC', async () => {
+  // Epoch seconds
+  assert.equal(parseUtcToUnixSeconds(1732103456), 1732103456);
+  assert.equal(parseUtcToUnixSeconds('1732103456'), 1732103456);
+
+  // Epoch milliseconds
+  assert.equal(parseUtcToUnixSeconds(1732103456000), 1732103456);
+  assert.equal(parseUtcToUnixSeconds('1732103456000'), 1732103456);
+
+  // ISO string with UTC Z
+  const expectedUtcSeconds = Math.floor(new Date('2026-11-20T12:00:00.000Z').getTime() / 1000);
+  assert.equal(parseUtcToUnixSeconds('2026-11-20T12:00:00.000Z'), expectedUtcSeconds);
+
+  // SQLite datetime space-separated format (YYYY-MM-DD HH:MM:SS) must be parsed explicitly as UTC
+  assert.equal(parseUtcToUnixSeconds('2026-11-20 12:00:00'), expectedUtcSeconds);
+
+  // Non-positive, missing, empty, or invalid values return null
+  assert.equal(parseUtcToUnixSeconds(null), null);
+  assert.equal(parseUtcToUnixSeconds(''), null);
+  assert.equal(parseUtcToUnixSeconds('   '), null);
+  assert.equal(parseUtcToUnixSeconds(0), null);
+  assert.equal(parseUtcToUnixSeconds(-100), null);
+  assert.equal(parseUtcToUnixSeconds('not-a-date'), null);
+});
+
+await test('Order missing paid_at fails safely with missing_paid_at and does not fabricate event_time', async () => {
+  const orderId = `ord_no_paid_at_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: `rzp_no_paid_at_${Date.now()}`,
+    customer_email: 'nopaidat@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid',
+    paid_at: null
+  });
+
+  globalThis.__lastMetaCapiCall = null;
+  const res = await sendCapiPurchaseEvent(orderId, mockEnv);
+  assert.equal(res.success, false);
+  assert.equal(res.status, 'missing_paid_at');
+  assert(res.error.includes('missing a valid payment capture timestamp'));
+  assert.equal(globalThis.__lastMetaCapiCall, null, 'Must NOT fabricate event_time or call Meta API');
+});
+
+await test('CAPI Purchase event preserves canonical paid_at timestamp across retries (never uses Date.now)', async () => {
+  const orderId = `ord_canonical_paid_at_${Date.now()}`;
+  const canonicalPaidAt = '2026-11-20T10:15:30.000Z';
+  const expectedUnixSeconds = Math.floor(new Date(canonicalPaidAt).getTime() / 1000);
+
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: `rzp_canonical_${Date.now()}`,
+    customer_email: 'canonical@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid',
+    paid_at: canonicalPaidAt
+  });
+
+  // First attempt fails at Meta API
+  globalThis.__mockMetaApiError = true;
+  const failRes = await sendCapiPurchaseEvent(orderId, mockEnv);
+  assert.equal(failRes.status, 'meta_api_error');
+  delete globalThis.__mockMetaApiError;
+
+  // Retry attempt succeeds
+  globalThis.__lastMetaCapiCall = null;
+  const retryRes = await sendCapiPurchaseEvent(orderId, mockEnv);
+  assert.equal(retryRes.status, 'sent');
+  assert(globalThis.__lastMetaCapiCall, 'Meta API must be called');
+  const ev = globalThis.__lastMetaCapiCall.body.data[0];
+  assert.equal(ev.event_time, expectedUnixSeconds, 'event_time must strictly match original paid_at, not retry time');
+});
+
+await test('verify-payment and webhook payment capture paths preserve paid_at using COALESCE without overwriting', async () => {
+  const orderId = `ord_coalesce_${Date.now()}`;
+  const rzpOrderId = `order_coalesce_${Date.now()}`;
+  const rzpPaymentId = `pay_coalesce_${Date.now()}`;
+  const initialCapturedEpoch = 1732103000;
+  const initialIso = new Date(initialCapturedEpoch * 1000).toISOString();
+
+  // Create initial order
+  mockDb.orders.set(rzpOrderId, {
+    id: orderId,
+    razorpay_order_id: rzpOrderId,
+    customer_email: 'coalesce@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'created',
+    paid_at: null
+  });
+
+  // 1. Webhook delivers payment first with initialCapturedEpoch
+  const eventPayload = {
+    event: 'payment.captured',
+    event_id: `evt_coalesce_${Date.now()}`,
+    created_at: initialCapturedEpoch,
+    payload: {
+      payment: {
+        entity: {
+          id: rzpPaymentId,
+          order_id: rzpOrderId,
+          status: 'captured',
+          amount: 100,
+          currency: 'INR'
+        }
+      }
+    }
+  };
+  const rawBody = JSON.stringify(eventPayload);
+  const sig = await computeWebhookSig(rawBody, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+
+  const whRes = await handleWebhook({
+    request: {
+      headers: new Headers({ 'x-razorpay-signature': sig }),
+      text: async () => rawBody
+    },
+    env: mockEnv
+  });
+  assert.equal(whRes.status, 200);
+
+  const storedOrder = mockDb.orders.get(rzpOrderId);
+  assert.equal(storedOrder.status, 'paid');
+  assert.equal(storedOrder.paid_at, initialIso, 'Webhook must set canonical paid_at');
+
+  // 2. verify-payment runs later with a different paymentData.created_at
+  globalThis.__mockPaymentId = rzpPaymentId;
+  globalThis.__mockPaymentOrderId = rzpOrderId;
+  globalThis.__mockPaymentStatus = 'captured';
+  globalThis.__mockPaymentAmount = 100;
+  globalThis.__mockPaymentCurrency = 'INR';
+  globalThis.__mockPaymentCreatedAt = 1732109999; // Different epoch
+
+  const verifySig = await computeWebhookSig(`${rzpOrderId}|${rzpPaymentId}`, mockEnv.RAZORPAY_KEY_SECRET);
+  const verifyRes = await handleVerifyPayment({
+    request: {
+      headers: new Headers({ 'cf-connecting-ip': '1.2.3.4' }),
+      json: async () => ({
+        order_id: orderId,
+        razorpay_order_id: rzpOrderId,
+        razorpay_payment_id: rzpPaymentId,
+        razorpay_signature: verifySig
+      })
+    },
+    env: mockEnv
+  });
+
+  delete globalThis.__mockPaymentId;
+  delete globalThis.__mockPaymentOrderId;
+  delete globalThis.__mockPaymentStatus;
+  delete globalThis.__mockPaymentAmount;
+  delete globalThis.__mockPaymentCurrency;
+  delete globalThis.__mockPaymentCreatedAt;
+
+  assert.equal(verifyRes.status, 200);
+  assert.equal(storedOrder.paid_at, initialIso, 'COALESCE must preserve original paid_at and never overwrite it');
+});
+
+await test('Meta CAPI endpoint uses Graph API v26.0 by default', async () => {
+  assert.equal(META_GRAPH_API_VERSION_DEFAULT, 'v26.0', 'Default Graph API version must be v26.0');
+
+  const orderId = `ord_capi_v26_${Date.now()}`;
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: `rzp_v26_${Date.now()}`,
+    customer_email: 'v26@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid',
+    paid_at: '2026-11-20T12:00:00.000Z'
+  });
+
+  globalThis.__lastMetaCapiCall = null;
+  const res = await sendCapiPurchaseEvent(orderId, mockEnv);
+  assert.equal(res.success, true);
+  assert(globalThis.__lastMetaCapiCall.url.startsWith('https://graph.facebook.com/v26.0/'), 'URL must start with https://graph.facebook.com/v26.0/');
+});
+
+await test('Webhook event timestamp is preferred over verification fallback', async () => {
+  const orderId = `ord_wh_preferred_${Date.now()}`;
+  const rzpOrderId = `order_wh_pref_${Date.now()}`;
+  const rzpPaymentId = `pay_wh_pref_${Date.now()}`;
+  const whEventEpoch = 1795171111;
+  const whIso = new Date(whEventEpoch * 1000).toISOString();
+
+  mockDb.orders.set(rzpOrderId, {
+    id: orderId,
+    razorpay_order_id: rzpOrderId,
+    customer_email: 'pref@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'created',
+    paid_at: null,
+    paid_at_source: null
+  });
+
+  // 1. Authoritative webhook arrives first
+  const eventPayload = {
+    event: 'payment.captured',
+    event_id: `evt_pref_${Date.now()}`,
+    created_at: whEventEpoch,
+    payload: {
+      payment: {
+        entity: {
+          id: rzpPaymentId,
+          order_id: rzpOrderId,
+          status: 'captured',
+          amount: 100,
+          currency: 'INR'
+        }
+      }
+    }
+  };
+  const rawBody = JSON.stringify(eventPayload);
+  const sig = await computeWebhookSig(rawBody, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+
+  const whRes = await handleWebhook({
+    request: {
+      headers: new Headers({ 'x-razorpay-signature': sig }),
+      text: async () => rawBody
+    },
+    env: mockEnv
+  });
+  assert.equal(whRes.status, 200);
+
+  const orderAfterWh = mockDb.orders.get(rzpOrderId);
+  assert.equal(orderAfterWh.paid_at, whIso);
+  assert.equal(orderAfterWh.paid_at_source, 'webhook');
+
+  // 2. Later verify-payment arrives: MUST prefer and preserve webhook timestamp
+  const verifySig = await computeWebhookSig(`${rzpOrderId}|${rzpPaymentId}`, mockEnv.RAZORPAY_KEY_SECRET);
+  globalThis.__mockPaymentId = rzpPaymentId;
+  globalThis.__mockPaymentOrderId = rzpOrderId;
+  globalThis.__mockPaymentStatus = 'captured';
+  globalThis.__mockPaymentAmount = 100;
+  globalThis.__mockPaymentCurrency = 'INR';
+
+  const verifyRes = await handleVerifyPayment({
+    request: {
+      headers: new Headers({ 'cf-connecting-ip': '1.2.3.4' }),
+      json: async () => ({
+        order_id: orderId,
+        razorpay_order_id: rzpOrderId,
+        razorpay_payment_id: rzpPaymentId,
+        razorpay_signature: verifySig
+      })
+    },
+    env: mockEnv
+  });
+  delete globalThis.__mockPaymentId;
+  delete globalThis.__mockPaymentOrderId;
+  delete globalThis.__mockPaymentStatus;
+  delete globalThis.__mockPaymentAmount;
+  delete globalThis.__mockPaymentCurrency;
+
+  assert.equal(verifyRes.status, 200);
+  assert.equal(orderAfterWh.paid_at, whIso, 'Verification must not overwrite authoritative webhook timestamp');
+  assert.equal(orderAfterWh.paid_at_source, 'webhook');
+});
+
+await test('Verification fallback is used only when authoritative timestamp is unavailable', async () => {
+  const orderId = `ord_fallback_only_${Date.now()}`;
+  const rzpOrderId = `order_fb_only_${Date.now()}`;
+  const rzpPaymentId = `pay_fb_only_${Date.now()}`;
+
+  mockDb.orders.set(rzpOrderId, {
+    id: orderId,
+    razorpay_order_id: rzpOrderId,
+    customer_email: 'fallback@example.com',
+    amount: 149,
+    currency: 'INR',
+    status: 'created',
+    paid_at: null,
+    paid_at_source: null
+  });
+
+  const verifySig = await computeWebhookSig(`${rzpOrderId}|${rzpPaymentId}`, mockEnv.RAZORPAY_KEY_SECRET);
+  globalThis.__mockPaymentId = rzpPaymentId;
+  globalThis.__mockPaymentOrderId = rzpOrderId;
+  globalThis.__mockPaymentStatus = 'captured';
+  globalThis.__mockPaymentAmount = 14900;
+  globalThis.__mockPaymentCurrency = 'INR';
+
+  const beforeVerify = Date.now();
+  const verifyRes = await handleVerifyPayment({
+    request: {
+      headers: new Headers({ 'cf-connecting-ip': '1.2.3.4' }),
+      json: async () => ({
+        order_id: orderId,
+        razorpay_order_id: rzpOrderId,
+        razorpay_payment_id: rzpPaymentId,
+        razorpay_signature: verifySig
+      })
+    },
+    env: mockEnv
+  });
+  const afterVerify = Date.now();
+
+  delete globalThis.__mockPaymentId;
+  delete globalThis.__mockPaymentOrderId;
+  delete globalThis.__mockPaymentStatus;
+  delete globalThis.__mockPaymentAmount;
+  delete globalThis.__mockPaymentCurrency;
+
+  assert.equal(verifyRes.status, 200);
+  const storedOrder = mockDb.orders.get(rzpOrderId);
+  assert.equal(storedOrder.paid_at_source, 'verify_approx', 'Must be marked as verification approximation');
+  const storedTimeMs = new Date(storedOrder.paid_at).getTime();
+  assert(storedTimeMs >= beforeVerify - 2000 && storedTimeMs <= afterVerify + 2000, 'Timestamp must be approximate server time');
+});
+
+await test('Later authoritative timestamp replaces an approximate fallback', async () => {
+  const orderId = `ord_replace_approx_${Date.now()}`;
+  const rzpOrderId = `order_rep_ap_${Date.now()}`;
+  const rzpPaymentId = `pay_rep_ap_${Date.now()}`;
+  const approximateIso = '2026-11-20T12:00:00.000Z';
+  const authoritativeEpoch = 1795175940; // 2026-11-20T11:59:00.000Z
+  const authoritativeIso = new Date(authoritativeEpoch * 1000).toISOString();
+
+  // Order was verified earlier with approximate fallback
+  mockDb.orders.set(rzpOrderId, {
+    id: orderId,
+    razorpay_order_id: rzpOrderId,
+    customer_email: 'replace_approx@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid',
+    paid_at: approximateIso,
+    paid_at_source: 'verify_approx'
+  });
+
+  // Later authoritative webhook arrives
+  const eventPayload = {
+    event: 'payment.captured',
+    event_id: `evt_rep_ap_${Date.now()}`,
+    created_at: authoritativeEpoch,
+    payload: {
+      payment: {
+        entity: {
+          id: rzpPaymentId,
+          order_id: rzpOrderId,
+          status: 'captured',
+          amount: 100,
+          currency: 'INR'
+        }
+      }
+    }
+  };
+  const rawBody = JSON.stringify(eventPayload);
+  const sig = await computeWebhookSig(rawBody, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+
+  const whRes = await handleWebhook({
+    request: {
+      headers: new Headers({ 'x-razorpay-signature': sig }),
+      text: async () => rawBody
+    },
+    env: mockEnv
+  });
+  assert.equal(whRes.status, 200);
+
+  const storedOrder = mockDb.orders.get(rzpOrderId);
+  assert.equal(storedOrder.paid_at, authoritativeIso, 'Authoritative webhook timestamp must replace approximate fallback');
+  assert.equal(storedOrder.paid_at_source, 'webhook');
+});
+
+await test('Duplicate webhook does not change the timestamp', async () => {
+  const orderId = `ord_dup_wh_time_${Date.now()}`;
+  const rzpOrderId = `order_dup_wh_${Date.now()}`;
+  const rzpPaymentId = `pay_dup_wh_${Date.now()}`;
+  const originalEpoch = 1795174000;
+  const originalIso = new Date(originalEpoch * 1000).toISOString();
+
+  mockDb.orders.set(rzpOrderId, {
+    id: orderId,
+    razorpay_order_id: rzpOrderId,
+    customer_email: 'dup_wh@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'created',
+    paid_at: null,
+    paid_at_source: null
+  });
+
+  const eventPayload = {
+    event: 'payment.captured',
+    event_id: `evt_dup_wh_1_${Date.now()}`,
+    created_at: originalEpoch,
+    payload: {
+      payment: {
+        entity: {
+          id: rzpPaymentId,
+          order_id: rzpOrderId,
+          status: 'captured',
+          amount: 100,
+          currency: 'INR'
+        }
+      }
+    }
+  };
+  const rawBody1 = JSON.stringify(eventPayload);
+  const sig1 = await computeWebhookSig(rawBody1, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+
+  await handleWebhook({
+    request: {
+      headers: new Headers({ 'x-razorpay-signature': sig1 }),
+      text: async () => rawBody1
+    },
+    env: mockEnv
+  });
+
+  const orderAfterFirst = mockDb.orders.get(rzpOrderId);
+  assert.equal(orderAfterFirst.paid_at, originalIso);
+
+  // Duplicate webhook delivery with different event_id but same capture event created_at
+  const dupPayload = { ...eventPayload, event_id: `evt_dup_wh_2_${Date.now()}` };
+  const rawBody2 = JSON.stringify(dupPayload);
+  const sig2 = await computeWebhookSig(rawBody2, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+
+  await handleWebhook({
+    request: {
+      headers: new Headers({ 'x-razorpay-signature': sig2 }),
+      text: async () => rawBody2
+    },
+    env: mockEnv
+  });
+
+  assert.equal(orderAfterFirst.paid_at, originalIso, 'Duplicate webhook must not change timestamp');
+  assert.equal(orderAfterFirst.paid_at_source, 'webhook');
+});
+
+await test('Older webhook events cannot overwrite a newer authoritative timestamp', async () => {
+  const orderId = `ord_older_wh_${Date.now()}`;
+  const rzpOrderId = `order_older_wh_${Date.now()}`;
+  const rzpPaymentId = `pay_older_wh_${Date.now()}`;
+  const newerEpoch = 1795175000;
+  const newerIso = new Date(newerEpoch * 1000).toISOString();
+  const olderEpoch = 1795172000;
+
+  mockDb.orders.set(rzpOrderId, {
+    id: orderId,
+    razorpay_order_id: rzpOrderId,
+    customer_email: 'older_wh@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid',
+    paid_at: newerIso,
+    paid_at_source: 'webhook'
+  });
+
+  // Older webhook delivery
+  const olderPayload = {
+    event: 'payment.captured',
+    event_id: `evt_older_${Date.now()}`,
+    created_at: olderEpoch,
+    payload: {
+      payment: {
+        entity: {
+          id: rzpPaymentId,
+          order_id: rzpOrderId,
+          status: 'captured',
+          amount: 100,
+          currency: 'INR'
+        }
+      }
+    }
+  };
+  const rawBody = JSON.stringify(olderPayload);
+  const sig = await computeWebhookSig(rawBody, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+
+  await handleWebhook({
+    request: {
+      headers: new Headers({ 'x-razorpay-signature': sig }),
+      text: async () => rawBody
+    },
+    env: mockEnv
+  });
+
+  const storedOrder = mockDb.orders.get(rzpOrderId);
+  assert.equal(storedOrder.paid_at, newerIso, 'Older webhook event cannot overwrite newer authoritative timestamp');
+  assert.equal(storedOrder.paid_at_source, 'webhook');
+});
+
+await test('CAPI event_time uses the canonical timestamp', async () => {
+  const orderId = `ord_capi_canonical_${Date.now()}`;
+  const canonicalTimestamp = '2026-11-20T14:30:00.000Z';
+  const expectedUnixSeconds = parseUtcToUnixSeconds(canonicalTimestamp);
+
+  mockDb.orders.set(orderId, {
+    id: orderId,
+    razorpay_order_id: `rzp_canonical_test_${Date.now()}`,
+    customer_email: 'canonical_test@example.com',
+    amount: 1,
+    currency: 'INR',
+    status: 'paid',
+    paid_at: canonicalTimestamp,
+    paid_at_source: 'webhook'
+  });
+
+  globalThis.__lastMetaCapiCall = null;
+  const res = await sendCapiPurchaseEvent(orderId, mockEnv);
+  assert.equal(res.success, true);
+  assert(globalThis.__lastMetaCapiCall, 'Meta API must be called');
+  const ev = globalThis.__lastMetaCapiCall.body.data[0];
+  assert.equal(ev.event_time, expectedUnixSeconds, 'CAPI event_time must match canonical timestamp in Unix seconds');
 });
 
 console.log('\n======================================================');

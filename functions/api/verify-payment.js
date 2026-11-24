@@ -1,5 +1,6 @@
 import { verifyRazorpaySignature } from './_aws_s3.js';
-import { processOrderEmail } from './_email.js';
+import { processOrderEmail, classifyEmailEnvironment } from './_email.js';
+import { sendCapiPurchaseEvent } from './_meta_capi.js';
 
 /**
  * POST /api/verify-payment
@@ -75,7 +76,7 @@ export async function onRequestPost(context) {
     if (env.DB) {
       try {
         existingOrder = await env.DB.prepare(`
-          SELECT id, razorpay_order_id, customer_email, amount, currency, status, download_token
+          SELECT id, razorpay_order_id, customer_email, amount, currency, status, download_token, paid_at, paid_at_source
           FROM orders
           WHERE id = ? OR razorpay_order_id = ?
         `).bind(targetOrderId, razorpay_order_id).first();
@@ -84,7 +85,7 @@ export async function onRequestPost(context) {
       }
     }
 
-    // 1. Order ID matching check
+    // 1. Order ID matching check & existing paid order token preservation
     if (existingOrder) {
       if (existingOrder.razorpay_order_id && existingOrder.razorpay_order_id !== razorpay_order_id) {
         return new Response(JSON.stringify({
@@ -93,6 +94,35 @@ export async function onRequestPost(context) {
           error: 'Order ID mismatch.'
         }), {
           status: 400,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+
+      // Idempotency: If already paid, preserve existing download token (unaffected by subsequent price changes)
+      if (existingOrder.status === 'paid' && existingOrder.download_token) {
+        // Trigger idempotent CAPI check in case previous attempt failed or webhook arrived first
+        const earlyCapiContext = {
+          clientIp: request.headers?.get ? (request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for')) : null,
+          userAgent: request.headers?.get ? request.headers.get('user-agent') : null,
+          sourceUrl: `https://${(request.headers?.get ? request.headers.get('host') : null) || 'ebooks.trenzy.store'}/thank-you/?order_id=${encodeURIComponent(existingOrder.id)}`,
+          paidAt: existingOrder.paid_at,
+          paidAtSource: existingOrder.paid_at_source || 'verify_approx',
+          customFetch: env.customFetch
+        };
+        const earlyCapiPromise = sendCapiPurchaseEvent(existingOrder.id, env, earlyCapiContext);
+        if (typeof waitUntil === 'function') {
+          waitUntil(earlyCapiPromise);
+        } else if (typeof context !== 'undefined' && context && typeof context.waitUntil === 'function') {
+          context.waitUntil(earlyCapiPromise);
+        }
+
+        return new Response(JSON.stringify({
+          success: true,
+          verified: true,
+          order_id: existingOrder.id,
+          download_token: existingOrder.download_token,
+          redirect_url: `/thank-you/?order_id=${encodeURIComponent(existingOrder.id)}&token=${encodeURIComponent(existingOrder.download_token)}`
+        }), {
           headers: { 'Content-Type': 'application/json' }
         });
       }
@@ -122,22 +152,10 @@ export async function onRequestPost(context) {
           headers: { 'Content-Type': 'application/json' }
         });
       }
-
-      // 3. Idempotency & existing download token preservation: If already paid, return existing token
-      if (existingOrder.status === 'paid' && existingOrder.download_token) {
-        return new Response(JSON.stringify({
-          success: true,
-          verified: true,
-          order_id: existingOrder.id,
-          download_token: existingOrder.download_token,
-          redirect_url: `/thank-you/?order_id=${encodeURIComponent(existingOrder.id)}&token=${encodeURIComponent(existingOrder.download_token)}`
-        }), {
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
     }
 
     // 4. Independent Razorpay API verification of captured payment status
+    let paymentData = null;
     if (rawKeySecret && rawKeyId && !isPlaceholder) {
       let rzpPaymentRes;
       try {
@@ -181,7 +199,6 @@ export async function onRequestPost(context) {
         });
       }
 
-      let paymentData;
       try {
         paymentData = await rzpPaymentRes.json();
       } catch (jsonErr) {
@@ -219,7 +236,7 @@ export async function onRequestPost(context) {
         });
       }
 
-      // Verify amount is exactly 14900 paise (149 INR)
+      // Verify amount matches expected configured amount in paise (e.g. 100 paise = 1 INR)
       const expectedAmountPaise = parseInt(env.PRODUCT_PRICE || '149', 10) * 100;
       if (paymentData.amount !== expectedAmountPaise) {
         return new Response(JSON.stringify({
@@ -271,6 +288,24 @@ export async function onRequestPost(context) {
       }
     }
 
+    // Determine payment capture timestamp (authoritative webhook vs server-side verification approximation)
+    let canonicalPaidAt = null;
+    let canonicalSource = null;
+
+    if (existingOrder?.paid_at_source === 'webhook' && existingOrder.paid_at) {
+      // Authoritative webhook timestamp already recorded; preserve it
+      canonicalPaidAt = existingOrder.paid_at;
+      canonicalSource = 'webhook';
+    } else if (existingOrder?.paid_at) {
+      // Previous verification timestamp already recorded; preserve it
+      canonicalPaidAt = existingOrder.paid_at;
+      canonicalSource = existingOrder.paid_at_source || 'verify_approx';
+    } else {
+      // No authoritative capture timestamp is available; use server-side verification timestamp as approximation
+      canonicalPaidAt = new Date().toISOString();
+      canonicalSource = 'verify_approx';
+    }
+
     // Generate secure random download token (or preserve existing)
     let downloadToken = existingOrder?.download_token;
     if (!downloadToken) {
@@ -288,19 +323,54 @@ export async function onRequestPost(context) {
               razorpay_payment_id = ?,
               razorpay_signature = ?,
               download_token = COALESCE(download_token, ?),
+              paid_at = CASE
+                          WHEN paid_at_source = 'webhook' THEN paid_at
+                          WHEN paid_at IS NOT NULL THEN paid_at
+                          ELSE ?
+                        END,
+              paid_at_source = CASE
+                                 WHEN paid_at_source = 'webhook' THEN paid_at_source
+                                 WHEN paid_at IS NOT NULL THEN paid_at_source
+                                 ELSE 'verify_approx'
+                               END,
               updated_at = datetime('now')
           WHERE razorpay_order_id = ? OR id = ?
-        `).bind(razorpay_payment_id, razorpay_signature || '', downloadToken, razorpay_order_id, targetOrderId).run();
+        `).bind(razorpay_payment_id, razorpay_signature || '', downloadToken, canonicalPaidAt, razorpay_order_id, targetOrderId).run();
 
         // Asynchronously dispatch purchase confirmation email with PDF attachment
-        const emailPromise = processOrderEmail(targetOrderId, env);
+        // Production environment detection takes precedence; staging/unknown/conflicting environments fail closed
+        const envCheck = classifyEmailEnvironment(env);
+        if (envCheck.shouldSuppressPurchaseDelivery) {
+          console.info(`[Payment Verify]: Staging email suppression active for order ${targetOrderId}. Skipping automatic email dispatch (${envCheck.reason}).`);
+        } else {
+          const emailPromise = processOrderEmail(targetOrderId, env);
+          if (typeof waitUntil === 'function') {
+            waitUntil(emailPromise);
+          } else if (typeof context !== 'undefined' && context && typeof context.waitUntil === 'function') {
+            context.waitUntil(emailPromise);
+          } else {
+            // Await in local test runners where waitUntil is not provided
+            await emailPromise;
+          }
+        }
+
+        // Asynchronously dispatch Meta Conversions API (CAPI) Purchase event
+        const capiContext = {
+          clientIp: request.headers?.get ? (request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for')) : null,
+          userAgent: request.headers?.get ? request.headers.get('user-agent') : null,
+          sourceUrl: `https://${(request.headers?.get ? request.headers.get('host') : null) || 'ebooks.trenzy.store'}/thank-you/?order_id=${encodeURIComponent(targetOrderId)}`,
+          paidAt: canonicalPaidAt,
+          paidAtSource: canonicalSource,
+          customFetch: env.customFetch
+        };
+        const capiPromise = sendCapiPurchaseEvent(targetOrderId, env, capiContext);
         if (typeof waitUntil === 'function') {
-          waitUntil(emailPromise);
+          waitUntil(capiPromise);
         } else if (typeof context !== 'undefined' && context && typeof context.waitUntil === 'function') {
-          context.waitUntil(emailPromise);
+          context.waitUntil(capiPromise);
         } else {
           // Await in local test runners where waitUntil is not provided
-          await emailPromise;
+          await capiPromise;
         }
       } catch (dbErr) {
         console.error('[D1 Verify Update Error]:', dbErr);
